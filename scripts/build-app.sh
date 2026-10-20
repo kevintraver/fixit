@@ -48,7 +48,7 @@ fi
 # checked-in plist placeholder. APP_VERSION wins (CI passes the tag version);
 # otherwise fall back to the latest release tag, keeping the plist value if
 # there are no tags.
-APP_VERSION="${APP_VERSION:-$(git -C "$ROOT" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}"
+APP_VERSION="${APP_VERSION:-$(git -C "$ROOT" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)}"
 if [[ -n "$APP_VERSION" ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" -c "Set :CFBundleVersion $APP_VERSION" "$CONTENTS/Info.plist"
 fi
