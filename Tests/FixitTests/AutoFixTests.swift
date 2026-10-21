@@ -165,15 +165,15 @@ import Testing
         RuntimeConfig(
             configDir: configDir, debugLogging: false, styles: RuntimeConfig.defaultStyles,
             pickerKey: nil, pickerModifiers: nil, autoFixKey: nil, autoFixModifiers: nil, autoFixStyleID: nil,
-            replaceWithoutClipboard: false, provider: .groq, model: "m", baseURL: URL(fileURLWithPath: "/"),
+            replaceWithoutClipboard: false, fixOnPause: false, fixOnPauseApps: [], fixOnPauseWait: 1, provider: .groq, model: "m", baseURL: URL(fileURLWithPath: "/"),
             referer: nil, appTitle: "Fixit", apiKeyEnv: nil)
     }
 
-    private func save(autoFixKey: String? = nil, autoFixStyle: String = "native", replaceWithoutClipboard: Bool = false) throws -> String {
+    private func save(autoFixKey: String? = nil, autoFixStyle: String = "native", replaceWithoutClipboard: Bool = false, fixOnPause: Bool = false, fixOnPauseApps: [String] = [], fixOnPauseWait: TimeInterval = TypingPauseDetector.defaultWait) throws -> String {
         try ConfigStore.save(
             config: config, styles: RuntimeConfig.defaultStyles, pickerKey: "0", pickerModifiers: ["command", "shift"],
             autoFixKey: autoFixKey, autoFixModifiers: ["command", "shift"], autoFixStyle: autoFixStyle,
-            replaceWithoutClipboard: replaceWithoutClipboard, prompts: [:], provider: .groq, model: nil, endpoint: nil)
+            replaceWithoutClipboard: replaceWithoutClipboard, fixOnPause: fixOnPause, fixOnPauseApps: fixOnPauseApps, fixOnPauseWait: fixOnPauseWait, prompts: [:], provider: .groq, model: nil, endpoint: nil)
         return try String(contentsOf: configDir.appendingPathComponent("config.json"), encoding: .utf8)
     }
 
@@ -183,6 +183,15 @@ import Testing
         #expect(json.contains("pickerShortcutKey"))
         #expect(!json.contains("autoFix"))
         #expect(!json.contains("replaceWithoutClipboard"))
+        #expect(!json.contains("fixOnPause"))
+    }
+
+    @Test func savesFixOnPauseWhenSet() throws {
+        defer { try? FileManager.default.removeItem(at: configDir) }
+        let saved = try JSONDecoder().decode(FixitConfig.self, from: Data(save(fixOnPause: true, fixOnPauseApps: ["com.apple.MobileSMS"], fixOnPauseWait: 0.7).utf8))
+        #expect(saved.fixOnPause == true)
+        #expect(saved.fixOnPauseApps == ["com.apple.MobileSMS"])
+        #expect(saved.fixOnPauseWait == 0.7)
     }
 
     @Test func savesAutoFixWhenSet() throws {
