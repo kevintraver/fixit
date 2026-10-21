@@ -1240,10 +1240,20 @@ enum AutoFixTarget: Equatable {
     static func isBlank(value: String?, placeholder: String?, classList: [String]) -> Bool {
         if classList.contains("ql-blank") { return true }
         guard let value else { return false }
-        let invisible = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{200B}\u{200C}\u{200D}\u{2060}\u{FEFF}"))
         let trimmed = value.trimmingCharacters(in: invisible)
         return trimmed.isEmpty || trimmed == placeholder?.trimmingCharacters(in: invisible)
     }
+
+    /// Whether the caret sits after the last character, so typing is adding to the end rather than editing
+    /// earlier text. Trailing whitespace doesn't count: Electron apps report an invisible final newline.
+    static func caretAtEnd(value: String, selection: NSRange) -> Bool {
+        guard selection.length == 0 else { return false }
+        let utf16 = Array(value.utf16)
+        guard selection.location < utf16.count else { return true }
+        return String(decoding: utf16[selection.location...], as: UTF16.self).trimmingCharacters(in: invisible).isEmpty
+    }
+
+    private static let invisible = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{200B}\u{200C}\u{200D}\u{2060}\u{FEFF}"))
 
     // `hasInlineImages`: rich editors like Slack's draw emoji as images and leave them out of the value,
     // so fixing that value would delete them.
@@ -1484,6 +1494,18 @@ enum TextSelectionIO {
         session.focusedElement = element
         session.fieldSnapshot = snapshot
         return session
+    }
+
+    /// Whether the caret in the frontmost app's focused field is at the end of its text; nil when the app
+    /// doesn't report the text or the caret.
+    @MainActor
+    static func caretAtEnd() -> Bool? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              let element = focusedElement(of: app) else { return nil }
+        let snapshot = fieldSnapshot(of: element)
+        guard let value = snapshot.value, let selection = snapshot.selection else { return nil }
+        return AutoFixTarget.caretAtEnd(value: value, selection: selection)
     }
 
     /// The frontmost app's focused field text as Accessibility reports it, without copying anything.
@@ -2653,7 +2675,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         let pauseHeader = NSTextField(labelWithString: "Fix on Pause (experimental)")
         pauseHeader.font = .boldSystemFont(ofSize: 13)
         pauseHeader.translatesAutoresizingMaskIntoConstraints = false
-        let pauseHelp = secondaryLabel("Runs auto-fix with the style above once you stop typing, in these apps only. Typing again before it finishes drops the fix. You can also add the app you're using from the menu bar.")
+        let pauseHelp = secondaryLabel("Runs auto-fix with the style above once you stop typing at the end of your text, in these apps only. Editing earlier text doesn't trigger it; use the shortcut then. Typing again before it finishes drops the fix. You can also add the app you're using from the menu bar.")
         fixOnPauseCheckbox.translatesAutoresizingMaskIntoConstraints = false
 
         pauseDelaySlider.minValue = TypingPauseDetector.waitRange.lowerBound
@@ -3809,6 +3831,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let lastPauseRequest, Date().timeIntervalSince(lastPauseRequest) < Self.pauseCooldown {
             schedulePauseFix(after: Self.pauseCooldown - Date().timeIntervalSince(lastPauseRequest), pid: pid)
+            return
+        }
+        // Back in the text to edit it: a fix now could rewrite what's being changed, so that's the hotkey's job.
+        if TextSelectionIO.caretAtEnd() == false {
+            logger.log("pausefix skipped", ["reason": "caret not at end"])
             return
         }
         if let value = TextSelectionIO.focusedValue(), value == lastPauseValue {

@@ -39,6 +39,41 @@ import Testing
     }
 }
 
+@Suite struct CaretAtEndTests {
+    private func atEnd(_ value: String, _ location: Int, length: Int = 0) -> Bool {
+        AutoFixTarget.caretAtEnd(value: value, selection: NSRange(location: location, length: length))
+    }
+
+    @Test func caretAfterTheLastCharacter() {
+        #expect(atEnd("lets go", 7))
+    }
+
+    @Test func trailingWhitespaceStillCountsAsTheEnd() {
+        // Electron apps report an invisible final newline.
+        #expect(atEnd("lets go\n", 7))
+        #expect(atEnd("lets go \u{200B}", 7))
+    }
+
+    @Test func caretInsideTheTextIsNotTheEnd() {
+        #expect(!atEnd("lets go", 3))
+        #expect(!atEnd("lets go\nsee you", 7))
+    }
+
+    @Test func aSelectionIsNotTheEnd() {
+        #expect(!atEnd("lets go", 4, length: 3))
+    }
+
+    @Test func countsEmojiInUTF16() {
+        #expect(atEnd("ok 🎉", 5))
+        #expect(!atEnd("ok 🎉 ok", 5))
+    }
+
+    @Test func caretPastTheTextCountsAsTheEnd() {
+        // Inline images can push the caret past the reported value.
+        #expect(atEnd("ok", 4))
+    }
+}
+
 @Suite struct TypingPauseDetectorTests {
     // Gaps come from Date arithmetic, which isn't exact.
     private func close(_ a: TimeInterval, _ b: TimeInterval) -> Bool {
