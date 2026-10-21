@@ -1282,7 +1282,9 @@ struct TypingPauseDetector {
     enum KeyKind: Equatable {
         case text
         case sentenceEnd
-        // Shortcuts, arrows and bare modifiers don't change text, so they don't restart the pause.
+        // Moves the caret without changing text: picks a pause back up when it lands at the end.
+        case navigation
+        // Shortcuts and bare modifiers don't change text, so they don't restart the pause.
         case ignored
     }
 
@@ -1297,12 +1299,17 @@ struct TypingPauseDetector {
     private(set) var lastKind: KeyKind = .text
     private var lastKey: Date?
 
+    // AppKit's arrow, Home, End, Page Up and Page Down characters.
+    private static let navigationKeys: Set<UInt32> = [0xF700, 0xF701, 0xF702, 0xF703, 0xF729, 0xF72B, 0xF72C, 0xF72D]
+
     static func kind(keyCode: UInt16, characters: String?, modifiers: NSEvent.ModifierFlags) -> KeyKind {
+        // With or without modifiers: ⌘→ and ⌥→ move the caret too.
+        if let scalar = characters?.unicodeScalars.first, navigationKeys.contains(scalar.value) { return .navigation }
         if !modifiers.intersection([.command, .control]).isEmpty { return .ignored }
         // Delete and Forward Delete.
         if keyCode == 51 || keyCode == 117 { return .text }
         guard let scalar = characters?.unicodeScalars.first else { return .ignored }
-        // AppKit's function-key range: arrows, Home/End, Page Up/Down, F-keys.
+        // The rest of AppKit's function-key range: F-keys and the like.
         if (0xF700...0xF8FF).contains(scalar.value) { return .ignored }
         if scalar.value == 0x1B { return .ignored }
         return [".", "!", "?", "…"].contains(Character(scalar)) ? .sentenceEnd : .text
@@ -1496,16 +1503,16 @@ enum TextSelectionIO {
         return session
     }
 
-    /// Whether the caret in the frontmost app's focused field is at the end of its text; nil when the app
-    /// doesn't report the text or the caret.
+    /// Where the caret is in the frontmost app's focused field, and whether that's the end of its text;
+    /// nil when the app doesn't report the text or the caret.
     @MainActor
-    static func caretAtEnd() -> Bool? {
+    static func caretPosition() -> (atEnd: Bool, caret: NSRange, length: Int)? {
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
               let element = focusedElement(of: app) else { return nil }
         let snapshot = fieldSnapshot(of: element)
         guard let value = snapshot.value, let selection = snapshot.selection else { return nil }
-        return AutoFixTarget.caretAtEnd(value: value, selection: selection)
+        return (AutoFixTarget.caretAtEnd(value: value, selection: selection), selection, value.utf16.count)
     }
 
     /// The frontmost app's focused field text as Accessibility reports it, without copying anything.
@@ -3606,7 +3613,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastTargetApp: NSRunningApplication?
     private var pauseToggleItem: NSMenuItem?
     // Fix on pause: a key monitor feeds the detector, whose delay debounces a timer that runs the fix.
-    private var pauseMonitor: Any?
+    private var pauseMonitors: [Any] = []
+    // The app typed in since the last pause fix; only then does moving the caret pick the pause back up.
+    private var editedApp: pid_t?
     private var pauseMonitorWait: Task<Void, Never>?
     private var pauseDetector = TypingPauseDetector()
     private var pauseTimer: Task<Void, Never>?
@@ -3766,7 +3775,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updatePauseMonitor() {
         let enabled = config.fixOnPause && !config.fixOnPauseApps.isEmpty
-        if enabled, pauseMonitor == nil {
+        if enabled, pauseMonitors.isEmpty {
             // A monitor added before Accessibility is granted never receives a key, even after the grant,
             // so wait for the grant first.
             guard AXIsProcessTrusted() else {
@@ -3783,26 +3792,40 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             // Global key monitors need only the Accessibility permission. Keys are classified, never kept.
-            pauseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let keys = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 let kind = TypingPauseDetector.kind(keyCode: event.keyCode, characters: event.characters, modifiers: event.modifierFlags)
                 MainActor.assumeIsolated {
-                    self?.typingKeyPressed(kind)
+                    self?.pauseInput(kind)
                 }
             }
+            // A click can put the caret back at the end too.
+            let clicks = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.pauseInput(.navigation)
+                }
+            }
+            pauseMonitors = [keys, clicks].compactMap { $0 }
         } else if !enabled {
             pauseMonitorWait?.cancel()
             pauseMonitorWait = nil
-            if let pauseMonitor {
-                NSEvent.removeMonitor(pauseMonitor)
-                self.pauseMonitor = nil
-            }
+            pauseMonitors.forEach(NSEvent.removeMonitor)
+            pauseMonitors = []
             pauseTimer?.cancel()
         }
     }
 
-    private func typingKeyPressed(_ kind: TypingPauseDetector.KeyKind) {
+    private func pauseInput(_ kind: TypingPauseDetector.KeyKind) {
         guard kind != .ignored, let app = NSWorkspace.shared.frontmostApplication,
               let bundleID = app.bundleIdentifier, config.fixOnPauseApps.contains(bundleID) else { return }
+        if kind == .navigation {
+            // Moving around without having typed has nothing to fix. A move to the end after an edit
+            // earlier in the text restarts the wait; the fix still checks the caret is at the end.
+            guard editedApp == app.processIdentifier else { return }
+            logger.log("pausefix caret moved")
+            schedulePauseFix(after: pauseDetector.delay(wait: config.fixOnPauseWait), pid: app.processIdentifier)
+            return
+        }
+        editedApp = app.processIdentifier
         pauseDetector.record(kind, at: Date())
         // The field is changing under any fix in flight, so its write would be dropped anyway.
         pauseFixTask?.cancel()
@@ -3834,11 +3857,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         // Back in the text to edit it: a fix now could rewrite what's being changed, so that's the hotkey's job.
-        if TextSelectionIO.caretAtEnd() == false {
-            logger.log("pausefix skipped", ["reason": "caret not at end"])
+        if let position = TextSelectionIO.caretPosition(), !position.atEnd {
+            logger.log("pausefix skipped", ["reason": "caret not at end", "caret": position.caret.location, "selected": position.caret.length, "length": position.length])
             return
         }
         if let value = TextSelectionIO.focusedValue(), value == lastPauseValue {
+            logger.log("pausefix skipped", ["reason": "unchanged since last fix"])
             return
         }
         isProcessing = true
@@ -3850,6 +3874,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let outcome = try await runAutoFix(style: style, quiet: true)
                 // Only text a fix finished with counts as clean; a cancelled or dropped one was never checked.
                 lastPauseValue = TextSelectionIO.focusedValue()
+                editedApp = nil
                 if outcome == .fixed {
                     pill.anchor = TextSelectionIO.caretAnchor()?.anchor
                     pill.show("✓ Fixed", hideAfter: 1.2)
