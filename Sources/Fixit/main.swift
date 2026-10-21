@@ -3620,11 +3620,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pauseDetector = TypingPauseDetector()
     private var pauseTimer: Task<Void, Never>?
     private var pauseFixTask: Task<Void, Never>?
-    private var lastPauseRequest: Date?
+    // When the last pause fix ran to the end. Ones cancelled by typing don't count, or a stop right after
+    // a hesitation would wait out a cooldown started by a fix that never finished.
+    private var lastPauseFinished: Date?
     // The field text a pause fix last left clean, so pausing again without typing doesn't call the model.
     private var lastPauseValue: String?
-    // However often typing pauses, at most one model call per this many seconds.
-    private static let pauseCooldown: TimeInterval = 2
+    // Rest after a finished pause fix before the next one.
+    private static let pauseCooldown: TimeInterval = 1
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         var startupError: Error?
@@ -3852,8 +3854,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return
         }
-        if let lastPauseRequest, Date().timeIntervalSince(lastPauseRequest) < Self.pauseCooldown {
-            schedulePauseFix(after: Self.pauseCooldown - Date().timeIntervalSince(lastPauseRequest), pid: pid)
+        if let lastPauseFinished, Date().timeIntervalSince(lastPauseFinished) < Self.pauseCooldown {
+            schedulePauseFix(after: Self.pauseCooldown - Date().timeIntervalSince(lastPauseFinished), pid: pid)
             return
         }
         // Back in the text to edit it: a fix now could rewrite what's being changed, so that's the hotkey's job.
@@ -3866,7 +3868,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         isProcessing = true
-        lastPauseRequest = Date()
         let style = RuntimeConfig.resolveStyle(id: config.autoFixStyleID, styles: config.styles)
         logger.log("pausefix start", ["styleId": style.id, "medianMs": Int(pauseDetector.median * 1000), "delayMs": Int(pauseDetector.delay(wait: config.fixOnPauseWait) * 1000)])
         pauseFixTask = Task { @MainActor in
@@ -3875,6 +3876,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // Only text a fix finished with counts as clean; a cancelled or dropped one was never checked.
                 lastPauseValue = TextSelectionIO.focusedValue()
                 editedApp = nil
+                lastPauseFinished = Date()
                 if outcome == .fixed {
                     pill.anchor = TextSelectionIO.caretAnchor()?.anchor
                     pill.show("✓ Fixed", hideAfter: 1.2)
@@ -3883,8 +3885,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 logger.log("pausefix skipped", ["reason": "cancelled"])
             } catch let error as URLError where error.code == .cancelled {
                 logger.log("pausefix skipped", ["reason": "cancelled"])
+            } catch FixitError.targetChanged {
+                // Typing carried on during the request; the next pause picks it up.
+                logger.log("pausefix skipped", ["reason": "text changed"])
+            } catch FixitError.noSelection {
+                logger.log("pausefix skipped", ["reason": "blank"])
             } catch {
-                // A pause never interrupts with an error panel; the hotkey reports problems.
+                // A pause never interrupts with an error panel; the hotkey reports problems. A failing
+                // provider still gets the cooldown, so it isn't retried on every pause.
+                lastPauseFinished = Date()
                 logger.log("pausefix skipped", ["reason": "\(error)"])
             }
             pauseFixTask = nil
