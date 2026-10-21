@@ -28,14 +28,22 @@ import Testing
         }
     }
 
-    @Test func shortcutsArrowsAndModifiersAreIgnored() {
+    @Test func shortcutsFunctionKeysAndModifiersAreIgnored() {
         // Includes Fixit's own synthetic ⌘A/⌘C/⌘V.
         #expect(kind("v", modifiers: .command) == .ignored)
         #expect(kind("a", modifiers: .control) == .ignored)
-        #expect(kind("\u{F702}", modifiers: [.function, .numericPad]) == .ignored)
+        #expect(kind("\u{F704}", modifiers: .function) == .ignored)
         #expect(kind("\u{1B}") == .ignored)
         #expect(kind(nil) == .ignored)
         #expect(kind("") == .ignored)
+    }
+
+    @Test func caretMovesAreNavigation() {
+        #expect(kind("\u{F702}", modifiers: [.function, .numericPad]) == .navigation)
+        #expect(kind("\u{F703}", modifiers: [.command, .function, .numericPad]) == .navigation)
+        #expect(kind("\u{F703}", modifiers: [.option, .function, .numericPad]) == .navigation)
+        #expect(kind("\u{F72B}", modifiers: .function) == .navigation)
+        #expect(kind("\u{F72D}", modifiers: .function) == .navigation)
     }
 }
 
