@@ -141,6 +141,11 @@ struct FixitConfig: Codable {
     let autoFixShortcutModifiers: [String]?
     let autoFixStyle: String?
     let replaceWithoutClipboard: Bool?
+    // Experimental: auto-fix by itself when typing pauses in these apps (bundle IDs).
+    var fixOnPause: Bool?
+    var fixOnPauseApps: [String]?
+    // Seconds to wait after typing stops, before scaling for rhythm and sentence ends.
+    let fixOnPauseWait: Double?
     let provider: String?
     let model: String?
     let endpoint: String?
@@ -160,6 +165,9 @@ struct FixitConfig: Codable {
         autoFixShortcutModifiers: [String]? = nil,
         autoFixStyle: String? = nil,
         replaceWithoutClipboard: Bool? = nil,
+        fixOnPause: Bool? = nil,
+        fixOnPauseApps: [String]? = nil,
+        fixOnPauseWait: Double? = nil,
         provider: String? = nil,
         model: String? = nil,
         endpoint: String? = nil,
@@ -177,6 +185,9 @@ struct FixitConfig: Codable {
         self.autoFixShortcutModifiers = autoFixShortcutModifiers
         self.autoFixStyle = autoFixStyle
         self.replaceWithoutClipboard = replaceWithoutClipboard
+        self.fixOnPause = fixOnPause
+        self.fixOnPauseApps = fixOnPauseApps
+        self.fixOnPauseWait = fixOnPauseWait
         self.provider = provider
         self.model = model
         self.endpoint = endpoint
@@ -200,6 +211,9 @@ struct RuntimeConfig {
     let autoFixStyleID: String?
     // Experimental: auto-fix writes through Accessibility instead of select-all + paste.
     let replaceWithoutClipboard: Bool
+    let fixOnPause: Bool
+    let fixOnPauseApps: [String]
+    let fixOnPauseWait: TimeInterval
     let provider: Provider
     let model: String
     let baseURL: URL
@@ -274,6 +288,9 @@ struct RuntimeConfig {
             autoFixModifiers: config.autoFixShortcutModifiers,
             autoFixStyleID: config.autoFixStyle,
             replaceWithoutClipboard: config.replaceWithoutClipboard ?? false,
+            fixOnPause: config.fixOnPause ?? false,
+            fixOnPauseApps: config.fixOnPauseApps ?? [],
+            fixOnPauseWait: config.fixOnPauseWait.map { min(max($0, TypingPauseDetector.waitRange.lowerBound), TypingPauseDetector.waitRange.upperBound) } ?? TypingPauseDetector.defaultWait,
             provider: provider,
             model: model,
             baseURL: baseURL,
@@ -308,6 +325,9 @@ struct RuntimeConfig {
             autoFixModifiers: nil,
             autoFixStyleID: nil,
             replaceWithoutClipboard: false,
+            fixOnPause: false,
+            fixOnPauseApps: [],
+            fixOnPauseWait: TypingPauseDetector.defaultWait,
             provider: provider,
             model: provider.defaultModel,
             baseURL: provider.defaultEndpoint.flatMap(URL.init(string:)) ?? URL(fileURLWithPath: "/"),
@@ -797,7 +817,7 @@ struct CLIParser {
 enum ConfigStore {
     // Auto-fix stays off without a key, and its modifiers are only written with one. Its style is also
     // written when picked away from the default, so the choice survives until a key is set.
-    static func save(config: RuntimeConfig, styles: [StyleConfig], pickerKey: String?, pickerModifiers: [String]?, autoFixKey: String?, autoFixModifiers: [String]?, autoFixStyle: String?, replaceWithoutClipboard: Bool, prompts: [String: String], provider: Provider, model: String?, endpoint: String?) throws {
+    static func save(config: RuntimeConfig, styles: [StyleConfig], pickerKey: String?, pickerModifiers: [String]?, autoFixKey: String?, autoFixModifiers: [String]?, autoFixStyle: String?, replaceWithoutClipboard: Bool, fixOnPause: Bool, fixOnPauseApps: [String], fixOnPauseWait: TimeInterval, prompts: [String: String], provider: Provider, model: String?, endpoint: String?) throws {
         try FileManager.default.createDirectory(at: config.configDir, withIntermediateDirectories: true)
         for (relativePath, prompt) in prompts {
             let url = config.configDir.appendingPathComponent(relativePath)
@@ -816,6 +836,9 @@ enum ConfigStore {
             autoFixStyle: autoFixKey != nil || autoFixStyle != RuntimeConfig.resolveStyle(id: nil, styles: styles).id ? autoFixStyle : nil,
             // Written only when on, so configs that never use it stay as they were.
             replaceWithoutClipboard: replaceWithoutClipboard ? true : nil,
+            fixOnPause: fixOnPause ? true : nil,
+            fixOnPauseApps: fixOnPauseApps.isEmpty ? nil : fixOnPauseApps,
+            fixOnPauseWait: fixOnPauseWait == TypingPauseDetector.defaultWait ? nil : fixOnPauseWait,
             provider: provider.rawValue,
             model: model,
             // Keep a hand-edited endpoint override when the provider didn't change.
@@ -826,6 +849,16 @@ enum ConfigStore {
             openRouterReferer: existing?.openRouterReferer,
             openRouterAppTitle: existing?.openRouterAppTitle
         ), configDir: config.configDir)
+    }
+
+    /// The menu bar's per-app toggle: changes only the pause apps, turning the feature on when one is added.
+    static func setFixOnPauseApps(_ apps: [String], configDir: URL) throws {
+        var config = loadExistingConfig(from: configDir) ?? FixitConfig()
+        config.fixOnPauseApps = apps.isEmpty ? nil : apps
+        if !apps.isEmpty {
+            config.fixOnPause = true
+        }
+        try write(config, configDir: configDir)
     }
 
     static func write(_ config: FixitConfig, configDir: URL) throws {
@@ -904,6 +937,9 @@ struct SetupDraft {
             autoFixShortcutModifiers: existing.autoFixShortcutModifiers,
             autoFixStyle: existing.autoFixStyle,
             replaceWithoutClipboard: existing.replaceWithoutClipboard,
+            fixOnPause: existing.fixOnPause,
+            fixOnPauseApps: existing.fixOnPauseApps,
+            fixOnPauseWait: existing.fixOnPauseWait,
             provider: keepsProvider ? existing.provider : provider.rawValue,
             model: keepsProvider ? existing.model : nil,
             endpoint: keepsProvider ? existing.endpoint : nil,
@@ -1203,6 +1239,79 @@ enum AutoFixTarget: Equatable {
     }
 }
 
+extension NSWorkspace {
+    /// The app's name for menus and Settings; its bundle ID when it isn't installed.
+    func appName(bundleID: String) -> String {
+        urlForApplication(withBundleIdentifier: bundleID)?.deletingPathExtension().lastPathComponent ?? bundleID
+    }
+}
+
+/// Decides when typing has paused long enough to fix, from the gaps between keystrokes. Typing research
+/// finds no single timeout fits everyone: pauses scale with each writer's own rhythm (their median gap
+/// between keys), and a finished sentence is a stronger stop signal than a pause mid-thought.
+struct TypingPauseDetector {
+    enum KeyKind: Equatable {
+        case text
+        case sentenceEnd
+        // Shortcuts, arrows and bare modifiers don't change text, so they don't restart the pause.
+        case ignored
+    }
+
+    // Until enough keys are seen, a typical desktop typist's gap.
+    static let priorMedian: TimeInterval = 0.18
+    static let minimumSamples = 10
+    static let window = 50
+    // Longer gaps are breaks, not rhythm; capping keeps them from dragging the median up.
+    static let gapCap: TimeInterval = 2
+
+    private(set) var gaps: [TimeInterval] = []
+    private(set) var lastKind: KeyKind = .text
+    private var lastKey: Date?
+
+    static func kind(keyCode: UInt16, characters: String?, modifiers: NSEvent.ModifierFlags) -> KeyKind {
+        if !modifiers.intersection([.command, .control]).isEmpty { return .ignored }
+        // Delete and Forward Delete.
+        if keyCode == 51 || keyCode == 117 { return .text }
+        guard let scalar = characters?.unicodeScalars.first else { return .ignored }
+        // AppKit's function-key range: arrows, Home/End, Page Up/Down, F-keys.
+        if (0xF700...0xF8FF).contains(scalar.value) { return .ignored }
+        if scalar.value == 0x1B { return .ignored }
+        return [".", "!", "?", "…"].contains(Character(scalar)) ? .sentenceEnd : .text
+    }
+
+    mutating func record(_ kind: KeyKind, at time: Date) {
+        if let lastKey {
+            gaps.append(min(time.timeIntervalSince(lastKey), Self.gapCap))
+            if gaps.count > Self.window {
+                gaps.removeFirst(gaps.count - Self.window)
+            }
+        }
+        lastKey = time
+        lastKind = kind
+    }
+
+    var median: TimeInterval {
+        guard gaps.count >= Self.minimumSamples else { return Self.priorMedian }
+        let sorted = gaps.sorted()
+        let middle = sorted.count / 2
+        return sorted.count.isMultiple(of: 2) ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle]
+    }
+
+    // The user's "Wait after typing" setting, in seconds.
+    static let waitRange: ClosedRange<TimeInterval> = 0.1...3
+    static let defaultWait: TimeInterval = 1
+
+    func delay(wait: TimeInterval) -> TimeInterval { Self.delay(median: median, after: lastKind, wait: wait) }
+
+    /// How long to wait after the last key. Mid-thought it's `wait`, stretched for slow typists (a multiple
+    /// of their median gap) up to three times `wait`. A finished sentence is a stronger stop signal, so it
+    /// waits half as long.
+    static func delay(median: TimeInterval, after kind: KeyKind, wait: TimeInterval) -> TimeInterval {
+        let pause = min(max(median * 8, wait), wait * 3)
+        return kind == .sentenceEnd ? pause / 2 : pause
+    }
+}
+
 /// Carries a caret position across an edit by anchoring it to the unchanged characters around it.
 enum CaretMapper {
     /// Where a caret at UTF-16 `offset` in `original` belongs in `fixed` (also a UTF-16 offset, as Accessibility uses).
@@ -1292,7 +1401,8 @@ enum TextSelectionIO {
 
     /// The selection if there is one, otherwise all the text in the focused field.
     @MainActor
-    static func captureForAutoFix() async throws -> TextTargetSession {
+    // `wholeFieldOnly`: fixing on a pause skips a selection, since selecting text isn't typing.
+    static func captureForAutoFix(wholeFieldOnly: Bool = false) async throws -> TextTargetSession {
         try ensureAccessibility()
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
@@ -1332,6 +1442,7 @@ enum TextSelectionIO {
             session.fieldSnapshot = snapshot
             return session
         case .selection:
+            if wholeFieldOnly { throw FixitError.noSelection }
             session = try await captureSelection()
         case .field(let value):
             guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw FixitError.noSelection }
@@ -1341,6 +1452,15 @@ enum TextSelectionIO {
         session.focusedElement = element
         session.fieldSnapshot = snapshot
         return session
+    }
+
+    /// The frontmost app's focused field text as Accessibility reports it, without copying anything.
+    @MainActor
+    static func focusedValue() -> String? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              let element = focusedElement(of: app) else { return nil }
+        return fieldSnapshot(of: element).value
     }
 
     /// False when focus moved or the field changed since capture, so writing would clobber something else.
@@ -2249,6 +2369,13 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
     private let autoFixStylePopup = NSPopUpButton()
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Launch Fixit at login", target: nil, action: nil)
     private let replaceWithoutClipboardCheckbox = NSButton(checkboxWithTitle: "Auto-fix without the clipboard (experimental)", target: nil, action: nil)
+    private let fixOnPauseCheckbox = NSButton(checkboxWithTitle: "Fix automatically when I pause typing", target: nil, action: nil)
+    private let pauseDelaySlider = NSSlider()
+    private let pauseDelayLabel = NSTextField(labelWithString: "")
+    private let pauseAppsTable = NSTableView()
+    private let pauseAppsControl = NSSegmentedControl()
+    private var pauseAppDrafts: [String] = []
+    private let tabView = NSTabView()
 
     private let styleTable = NSTableView()
     private let addRemoveControl = NSSegmentedControl()
@@ -2298,6 +2425,11 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         autoFixShortcutField.stringValue = ShortcutParser.display(key: config.autoFixKey, modifiers: config.autoFixModifiers)
         launchAtLoginCheckbox.state = SMAppService.mainApp.status == .enabled ? .on : .off
         replaceWithoutClipboardCheckbox.state = config.replaceWithoutClipboard ? .on : .off
+        fixOnPauseCheckbox.state = config.fixOnPause ? .on : .off
+        pauseDelaySlider.doubleValue = config.fixOnPauseWait
+        pauseDelayChanged()
+        pauseAppDrafts = config.fixOnPauseApps
+        pauseAppsTable.reloadData()
         statusLabel.stringValue = "API keys, shortcuts, and prompts are stored in \(config.configDir.path)."
     }
 
@@ -2344,17 +2476,25 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             lines.append("  \(type(of: view)): \(view.frame)")
         }
         FileHandle.standardError.write(Data((lines.joined(separator: "\n") + "\n").utf8))
-        if let rep = contentView.bitmapImageRepForCachingDisplay(in: contentView.bounds) {
-            contentView.cacheDisplay(in: contentView.bounds, to: rep)
-            if let png = rep.representation(using: .png, properties: [:]) {
-                try? png.write(to: URL(fileURLWithPath: "/tmp/fixit-settings-debug.png"))
+        // One image per tab: /tmp/fixit-settings-debug-0.png and so on.
+        for index in tabView.tabViewItems.indices {
+            tabView.selectTabViewItem(at: index)
+            contentView.layoutSubtreeIfNeeded()
+            if let rep = contentView.bitmapImageRepForCachingDisplay(in: contentView.bounds) {
+                contentView.cacheDisplay(in: contentView.bounds, to: rep)
+                if let png = rep.representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: "/tmp/fixit-settings-debug-\(index).png"))
+                }
             }
         }
+        tabView.selectTabViewItem(at: 0)
     }
 
     func show(message: String? = nil) {
         if let message {
             statusLabel.stringValue = message
+            // Messages are about the provider or key, which live on General.
+            tabView.selectTabViewItem(at: 0)
         }
         window?.center()
         window?.makeKeyAndOrderFront(nil)
@@ -2376,6 +2516,54 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             return label
         }
 
+        func formGrid(_ rows: [[NSView]]) -> NSGridView {
+            let grid = NSGridView(views: rows)
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            grid.rowSpacing = 8
+            grid.columnSpacing = 10
+            grid.rowAlignment = .firstBaseline
+            grid.column(at: 0).xPlacement = .trailing
+            grid.column(at: 1).xPlacement = .fill
+            return grid
+        }
+
+        func secondaryLabel(_ text: String) -> NSTextField {
+            let label = NSTextField(wrappingLabelWithString: text)
+            label.font = .systemFont(ofSize: 11)
+            label.textColor = .secondaryLabelColor
+            label.translatesAutoresizingMaskIntoConstraints = false
+            return label
+        }
+
+        func listTable(_ table: NSTableView) -> NSScrollView {
+            table.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name")))
+            table.headerView = nil
+            table.rowHeight = 22
+            table.style = .fullWidth
+            table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+            table.dataSource = self
+            table.delegate = self
+            let scroll = NSScrollView()
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            scroll.documentView = table
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .bezelBorder
+            return scroll
+        }
+
+        func addRemoveButtons(_ control: NSSegmentedControl, noun: String, action: Selector) {
+            control.segmentStyle = .smallSquare
+            control.trackingMode = .momentary
+            control.segmentCount = 2
+            control.setImage(NSImage(systemSymbolName: "plus", accessibilityDescription: "Add \(noun)"), forSegment: 0)
+            control.setImage(NSImage(systemSymbolName: "minus", accessibilityDescription: "Remove \(noun)"), forSegment: 1)
+            control.setWidth(28, forSegment: 0)
+            control.setWidth(28, forSegment: 1)
+            control.target = self
+            control.action = action
+            control.translatesAutoresizingMaskIntoConstraints = false
+        }
+
         pickerShortcutField.placeholderString = "cmd+shift+0"
         autoFixShortcutField.placeholderString = "Off"
         autoFixShortcutField.toolTip = "Fixes the text field you're typing in (or the selected text) in place, with no review panel. Leave empty to turn it off."
@@ -2392,80 +2580,81 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         providerHelpRow.addArrangedSubview(providerHelpLabel)
         providerHelpRow.addArrangedSubview(providerLinkLabel)
 
-        let formGrid = NSGridView(views: [
+        // MARK: General
+
+        let general = NSView()
+        let generalGrid = formGrid([
             [formLabel("Provider:"), providerPopup],
             [formLabel("API Key:"), apiKeyField],
             [NSGridCell.emptyContentView, providerHelpRow],
             [formLabel("Model:"), modelField],
             [formLabel("Endpoint:"), endpointField],
             [formLabel("Picker Shortcut:"), pickerShortcutField],
-            [formLabel("Auto-fix Shortcut:"), autoFixShortcutField],
-            [formLabel("Auto-fix Style:"), autoFixStylePopup],
-            [NSGridCell.emptyContentView, replaceWithoutClipboardCheckbox],
             [NSGridCell.emptyContentView, launchAtLoginCheckbox],
         ])
-        formGrid.translatesAutoresizingMaskIntoConstraints = false
-        formGrid.rowSpacing = 8
-        formGrid.columnSpacing = 10
-        formGrid.rowAlignment = .firstBaseline
-        formGrid.column(at: 0).xPlacement = .trailing
-        formGrid.column(at: 1).xPlacement = .fill
-        formGrid.cell(for: providerPopup)?.xPlacement = .leading
-        formGrid.cell(for: autoFixStylePopup)?.xPlacement = .leading
-        formGrid.cell(for: launchAtLoginCheckbox)?.xPlacement = .leading
-        formGrid.cell(for: replaceWithoutClipboardCheckbox)?.xPlacement = .leading
+        generalGrid.cell(for: providerPopup)?.xPlacement = .leading
+        generalGrid.cell(for: launchAtLoginCheckbox)?.xPlacement = .leading
+        general.addSubview(generalGrid)
+
+        // MARK: Auto-fix
+
+        let autoFix = NSView()
+        let autoFixHelp = secondaryLabel("A shortcut that fixes the field you're typing in (or the selected text) in place, without the review panel.")
+        let autoFixGrid = formGrid([
+            [formLabel("Shortcut:"), autoFixShortcutField],
+            [formLabel("Style:"), autoFixStylePopup],
+            [NSGridCell.emptyContentView, replaceWithoutClipboardCheckbox],
+        ])
+        autoFixGrid.cell(for: autoFixStylePopup)?.xPlacement = .leading
+        autoFixGrid.cell(for: replaceWithoutClipboardCheckbox)?.xPlacement = .leading
         replaceWithoutClipboardCheckbox.toolTip = "Writes the fix straight into the field, so the text never flashes selected. Some apps can't undo it or won't notice the change; Fixit pastes instead when a write is rejected."
 
+        let pauseSeparator = NSBox()
+        pauseSeparator.boxType = .separator
+        pauseSeparator.translatesAutoresizingMaskIntoConstraints = false
+        let pauseHeader = NSTextField(labelWithString: "Fix on Pause (experimental)")
+        pauseHeader.font = .boldSystemFont(ofSize: 13)
+        pauseHeader.translatesAutoresizingMaskIntoConstraints = false
+        let pauseHelp = secondaryLabel("Runs auto-fix with the style above once you stop typing, in these apps only. Typing again before it finishes drops the fix. You can also add the app you're using from the menu bar.")
+        fixOnPauseCheckbox.translatesAutoresizingMaskIntoConstraints = false
 
-        let separator = NSBox()
-        separator.boxType = .separator
-        separator.translatesAutoresizingMaskIntoConstraints = false
+        pauseDelaySlider.minValue = TypingPauseDetector.waitRange.lowerBound
+        pauseDelaySlider.maxValue = TypingPauseDetector.waitRange.upperBound
+        pauseDelaySlider.target = self
+        pauseDelaySlider.action = #selector(pauseDelayChanged)
+        pauseDelayLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let pauseDelayRow = NSStackView(views: [pauseDelaySlider, pauseDelayLabel])
+        pauseDelayRow.orientation = .horizontal
+        pauseDelayRow.spacing = 8
+        pauseDelaySlider.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        let pauseDelayGrid = formGrid([[formLabel("Wait after typing:"), pauseDelayRow]])
+        pauseDelayGrid.cell(for: pauseDelayRow)?.xPlacement = .leading
+        let pauseDelayHelp = secondaryLabel("About half as long after a finished sentence, and longer if you type slowly.")
 
-        let stylesHeader = NSTextField(labelWithString: "Styles")
-        stylesHeader.font = .boldSystemFont(ofSize: 13)
-        stylesHeader.translatesAutoresizingMaskIntoConstraints = false
+        let pauseAppsLabel = NSTextField(labelWithString: "Apps:")
+        pauseAppsLabel.translatesAutoresizingMaskIntoConstraints = false
+        let pauseAppsScroll = listTable(pauseAppsTable)
+        addRemoveButtons(pauseAppsControl, noun: "app", action: #selector(pauseAppsControlPressed(_:)))
 
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("style"))
-        styleTable.addTableColumn(column)
-        styleTable.headerView = nil
-        styleTable.rowHeight = 22
-        styleTable.style = .fullWidth
-        styleTable.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+        for view in [autoFixHelp, autoFixGrid, pauseSeparator, pauseHeader, pauseHelp, fixOnPauseCheckbox, pauseDelayGrid, pauseDelayHelp, pauseAppsLabel, pauseAppsScroll, pauseAppsControl] {
+            autoFix.addSubview(view)
+        }
+
+        // MARK: Styles
+
+        let styles = NSView()
+        let tableScroll = listTable(styleTable)
         styleTable.allowsEmptySelection = false
-        styleTable.dataSource = self
-        styleTable.delegate = self
-
-        let tableScroll = NSScrollView()
-        tableScroll.translatesAutoresizingMaskIntoConstraints = false
-        tableScroll.documentView = styleTable
-        tableScroll.hasVerticalScroller = true
-        tableScroll.borderType = .bezelBorder
-
-        addRemoveControl.segmentStyle = .smallSquare
-        addRemoveControl.trackingMode = .momentary
-        addRemoveControl.segmentCount = 2
-        addRemoveControl.setImage(NSImage(systemSymbolName: "plus", accessibilityDescription: "Add style"), forSegment: 0)
-        addRemoveControl.setImage(NSImage(systemSymbolName: "minus", accessibilityDescription: "Remove style"), forSegment: 1)
-        addRemoveControl.setWidth(28, forSegment: 0)
-        addRemoveControl.setWidth(28, forSegment: 1)
-        addRemoveControl.target = self
-        addRemoveControl.action = #selector(addRemovePressed(_:))
-        addRemoveControl.translatesAutoresizingMaskIntoConstraints = false
+        addRemoveButtons(addRemoveControl, noun: "style", action: #selector(addRemovePressed(_:)))
 
         styleNameField.placeholderString = "Style name"
         styleNameField.delegate = self
         styleShortcutField.placeholderString = "cmd+shift+1"
 
-        let detailGrid = NSGridView(views: [
+        let detailGrid = formGrid([
             [formLabel("Name:"), styleNameField],
             [formLabel("Shortcut:"), styleShortcutField],
         ])
-        detailGrid.translatesAutoresizingMaskIntoConstraints = false
-        detailGrid.rowSpacing = 8
-        detailGrid.columnSpacing = 10
-        detailGrid.rowAlignment = .firstBaseline
-        detailGrid.column(at: 0).xPlacement = .trailing
-        detailGrid.column(at: 1).xPlacement = .fill
 
         let promptLabel = NSTextField(labelWithString: "Prompt:")
         promptLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -2488,6 +2677,20 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         promptScroll.hasVerticalScroller = true
         promptScroll.borderType = .bezelBorder
 
+        for view in [tableScroll, addRemoveControl, detailGrid, promptLabel, promptScroll] {
+            styles.addSubview(view)
+        }
+
+        // MARK: Window
+
+        for (label, view) in [("General", general), ("Auto-fix", autoFix), ("Styles", styles)] {
+            let item = NSTabViewItem(identifier: label)
+            item.label = label
+            item.view = view
+            tabView.addTabViewItem(item)
+        }
+        tabView.translatesAutoresizingMaskIntoConstraints = false
+
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byWordWrapping
@@ -2501,45 +2704,76 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         saveButton.keyEquivalent = "\r"
         saveButton.translatesAutoresizingMaskIntoConstraints = false
 
-        for view in [formGrid, separator, stylesHeader, tableScroll, addRemoveControl, detailGrid, promptLabel, promptScroll, statusLabel, cancelButton, saveButton] {
+        for view in [tabView, statusLabel, cancelButton, saveButton] {
             contentView.addSubview(view)
         }
 
         let inset: CGFloat = 20
+        // Field columns line up across tabs.
+        let fieldColumn: CGFloat = 140
         NSLayoutConstraint.activate([
-            formGrid.topAnchor.constraint(equalTo: contentView.topAnchor, constant: inset),
-            formGrid.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: inset),
-            formGrid.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -inset),
+            tabView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
+            tabView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: inset),
+            tabView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -inset),
+            tabView.bottomAnchor.constraint(equalTo: saveButton.topAnchor, constant: -12),
+
+            generalGrid.topAnchor.constraint(equalTo: general.topAnchor, constant: inset),
+            generalGrid.leadingAnchor.constraint(equalTo: general.leadingAnchor, constant: inset),
+            generalGrid.trailingAnchor.constraint(equalTo: general.trailingAnchor, constant: -inset),
             // Fix the field column's leading edge; otherwise the grid dumps slack into the label column.
-            apiKeyField.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 150),
+            apiKeyField.leadingAnchor.constraint(equalTo: general.leadingAnchor, constant: fieldColumn),
 
-            separator.topAnchor.constraint(equalTo: formGrid.bottomAnchor, constant: 14),
-            separator.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: inset),
-            separator.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -inset),
+            autoFixHelp.topAnchor.constraint(equalTo: autoFix.topAnchor, constant: inset),
+            autoFixHelp.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: inset),
+            autoFixHelp.trailingAnchor.constraint(equalTo: autoFix.trailingAnchor, constant: -inset),
+            autoFixGrid.topAnchor.constraint(equalTo: autoFixHelp.bottomAnchor, constant: 12),
+            autoFixGrid.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: inset),
+            autoFixGrid.trailingAnchor.constraint(equalTo: autoFix.trailingAnchor, constant: -inset),
+            autoFixShortcutField.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: fieldColumn),
 
-            stylesHeader.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 12),
-            stylesHeader.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: inset),
+            pauseSeparator.topAnchor.constraint(equalTo: autoFixGrid.bottomAnchor, constant: 16),
+            pauseSeparator.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: inset),
+            pauseSeparator.trailingAnchor.constraint(equalTo: autoFix.trailingAnchor, constant: -inset),
+            pauseHeader.topAnchor.constraint(equalTo: pauseSeparator.bottomAnchor, constant: 12),
+            pauseHeader.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: inset),
+            pauseHelp.topAnchor.constraint(equalTo: pauseHeader.bottomAnchor, constant: 4),
+            pauseHelp.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: inset),
+            pauseHelp.trailingAnchor.constraint(equalTo: autoFix.trailingAnchor, constant: -inset),
+            fixOnPauseCheckbox.topAnchor.constraint(equalTo: pauseHelp.bottomAnchor, constant: 10),
+            fixOnPauseCheckbox.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: fieldColumn),
+            pauseDelayGrid.topAnchor.constraint(equalTo: fixOnPauseCheckbox.bottomAnchor, constant: 10),
+            pauseDelayGrid.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: inset),
+            pauseDelaySlider.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: fieldColumn),
+            pauseDelayHelp.topAnchor.constraint(equalTo: pauseDelayGrid.bottomAnchor, constant: 4),
+            pauseDelayHelp.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: fieldColumn),
+            pauseDelayHelp.trailingAnchor.constraint(equalTo: autoFix.trailingAnchor, constant: -inset),
+            pauseAppsScroll.topAnchor.constraint(equalTo: pauseDelayHelp.bottomAnchor, constant: 12),
+            pauseAppsScroll.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: fieldColumn),
+            pauseAppsScroll.widthAnchor.constraint(equalToConstant: 260),
+            pauseAppsLabel.topAnchor.constraint(equalTo: pauseAppsScroll.topAnchor, constant: 2),
+            pauseAppsLabel.trailingAnchor.constraint(equalTo: pauseAppsScroll.leadingAnchor, constant: -10),
+            pauseAppsControl.topAnchor.constraint(equalTo: pauseAppsScroll.bottomAnchor, constant: 4),
+            pauseAppsControl.leadingAnchor.constraint(equalTo: pauseAppsScroll.leadingAnchor),
+            pauseAppsControl.bottomAnchor.constraint(lessThanOrEqualTo: autoFix.bottomAnchor, constant: -inset),
+            pauseAppsScroll.heightAnchor.constraint(equalToConstant: 96),
 
-            tableScroll.topAnchor.constraint(equalTo: stylesHeader.bottomAnchor, constant: 8),
-            tableScroll.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: inset),
+            tableScroll.topAnchor.constraint(equalTo: styles.topAnchor, constant: inset),
+            tableScroll.leadingAnchor.constraint(equalTo: styles.leadingAnchor, constant: inset),
             tableScroll.widthAnchor.constraint(equalToConstant: 170),
-
             addRemoveControl.topAnchor.constraint(equalTo: tableScroll.bottomAnchor, constant: 4),
             addRemoveControl.leadingAnchor.constraint(equalTo: tableScroll.leadingAnchor),
+            addRemoveControl.bottomAnchor.constraint(equalTo: styles.bottomAnchor, constant: -inset),
 
             detailGrid.topAnchor.constraint(equalTo: tableScroll.topAnchor),
             detailGrid.leadingAnchor.constraint(equalTo: tableScroll.trailingAnchor, constant: 16),
-            detailGrid.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -inset),
-
+            detailGrid.trailingAnchor.constraint(equalTo: styles.trailingAnchor, constant: -inset),
             promptLabel.topAnchor.constraint(equalTo: detailGrid.bottomAnchor, constant: 10),
             promptLabel.leadingAnchor.constraint(equalTo: detailGrid.leadingAnchor),
-
             promptScroll.topAnchor.constraint(equalTo: promptLabel.bottomAnchor, constant: 4),
             promptScroll.leadingAnchor.constraint(equalTo: detailGrid.leadingAnchor),
-            promptScroll.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -inset),
+            promptScroll.trailingAnchor.constraint(equalTo: styles.trailingAnchor, constant: -inset),
             promptScroll.bottomAnchor.constraint(equalTo: addRemoveControl.bottomAnchor),
 
-            saveButton.topAnchor.constraint(equalTo: addRemoveControl.bottomAnchor, constant: 16),
             saveButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -inset),
             saveButton.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -inset),
             cancelButton.trailingAnchor.constraint(equalTo: saveButton.leadingAnchor, constant: -10),
@@ -2549,6 +2783,36 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -12),
             statusLabel.centerYAnchor.constraint(equalTo: saveButton.centerYAnchor),
         ])
+    }
+
+    @objc private func pauseDelayChanged() {
+        pauseDelayLabel.stringValue = String(format: "%.1f s", pauseDelaySlider.doubleValue)
+    }
+
+    // Edits, like everything here, only take effect on Save.
+    @objc private func pauseAppsControlPressed(_ sender: NSSegmentedControl) {
+        if sender.selectedSegment == 0 {
+            addPauseApps()
+        } else if pauseAppDrafts.indices.contains(pauseAppsTable.selectedRow) {
+            pauseAppDrafts.remove(at: pauseAppsTable.selectedRow)
+            pauseAppsTable.reloadData()
+        }
+    }
+
+    private func addPauseApps() {
+        guard let window else { return }
+        let panel = NSOpenPanel()
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let self else { return }
+            for bundleID in panel.urls.compactMap({ Bundle(url: $0)?.bundleIdentifier }) where !self.pauseAppDrafts.contains(bundleID) {
+                self.pauseAppDrafts.append(bundleID)
+            }
+            self.pauseAppsTable.reloadData()
+        }
     }
 
     private func rebuildStyleDrafts(config: RuntimeConfig) {
@@ -2573,7 +2837,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
     // MARK: Style list
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        styleDrafts.count
+        tableView === pauseAppsTable ? pauseAppDrafts.count : styleDrafts.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -2595,11 +2859,14 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
                 text.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
             ])
         }
-        cell.textField?.stringValue = styleDrafts[row].label
+        cell.textField?.stringValue = tableView === pauseAppsTable
+            ? NSWorkspace.shared.appName(bundleID: pauseAppDrafts[row])
+            : styleDrafts[row].label
         return cell
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        guard (notification.object as? NSTableView) === styleTable else { return }
         commitDetailFields()
         syncSelection()
     }
@@ -2750,6 +3017,9 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
                 autoFixModifiers: autoFixShortcut.modifiers,
                 autoFixStyle: selectedAutoFixStyleID,
                 replaceWithoutClipboard: replaceWithoutClipboardCheckbox.state == .on,
+                fixOnPause: fixOnPauseCheckbox.state == .on,
+                fixOnPauseApps: pauseAppDrafts,
+                fixOnPauseWait: (pauseDelaySlider.doubleValue * 10).rounded() / 10,
                 prompts: prompts,
                 provider: provider,
                 model: model.isEmpty ? nil : model,
@@ -3257,7 +3527,7 @@ enum CLIInstaller {
 }
 
 @MainActor
-final class AppController: NSObject, NSApplicationDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var config: RuntimeConfig!
     private var logger: Logger!
     private var promptLoader: PromptLoader!
@@ -3274,6 +3544,18 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var currentFixTask: Task<Void, Never>?
     private var autoFixTask: Task<Void, Never>?
     private var lastTargetApp: NSRunningApplication?
+    private var pauseToggleItem: NSMenuItem?
+    // Fix on pause: a key monitor feeds the detector, whose delay debounces a timer that runs the fix.
+    private var pauseMonitor: Any?
+    private var pauseMonitorWait: Task<Void, Never>?
+    private var pauseDetector = TypingPauseDetector()
+    private var pauseTimer: Task<Void, Never>?
+    private var pauseFixTask: Task<Void, Never>?
+    private var lastPauseRequest: Date?
+    // The field text a pause fix last left clean, so pausing again without typing doesn't call the model.
+    private var lastPauseValue: String?
+    // However often typing pauses, at most one model call per this many seconds.
+    private static let pauseCooldown: TimeInterval = 2
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         var startupError: Error?
@@ -3383,6 +3665,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             autoFixTask.cancel()
             return
         }
+        // The hotkey does what a pending pause fix would; one running already does the same job.
+        pauseTimer?.cancel()
         guard !isProcessing else { return }
         isProcessing = true
         let style = RuntimeConfig.resolveStyle(id: config.autoFixStyleID, styles: config.styles)
@@ -3420,6 +3704,104 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func updatePauseMonitor() {
+        let enabled = config.fixOnPause && !config.fixOnPauseApps.isEmpty
+        if enabled, pauseMonitor == nil {
+            // A monitor added before Accessibility is granted never receives a key, even after the grant,
+            // so wait for the grant first.
+            guard AXIsProcessTrusted() else {
+                if pauseMonitorWait == nil {
+                    pauseMonitorWait = Task { @MainActor [weak self] in
+                        while !AXIsProcessTrusted() {
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)
+                            if Task.isCancelled { return }
+                        }
+                        self?.pauseMonitorWait = nil
+                        self?.updatePauseMonitor()
+                    }
+                }
+                return
+            }
+            // Global key monitors need only the Accessibility permission. Keys are classified, never kept.
+            pauseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                let kind = TypingPauseDetector.kind(keyCode: event.keyCode, characters: event.characters, modifiers: event.modifierFlags)
+                MainActor.assumeIsolated {
+                    self?.typingKeyPressed(kind)
+                }
+            }
+        } else if !enabled {
+            pauseMonitorWait?.cancel()
+            pauseMonitorWait = nil
+            if let pauseMonitor {
+                NSEvent.removeMonitor(pauseMonitor)
+                self.pauseMonitor = nil
+            }
+            pauseTimer?.cancel()
+        }
+    }
+
+    private func typingKeyPressed(_ kind: TypingPauseDetector.KeyKind) {
+        guard kind != .ignored, let app = NSWorkspace.shared.frontmostApplication,
+              let bundleID = app.bundleIdentifier, config.fixOnPauseApps.contains(bundleID) else { return }
+        pauseDetector.record(kind, at: Date())
+        // The field is changing under any fix in flight, so its write would be dropped anyway.
+        pauseFixTask?.cancel()
+        schedulePauseFix(after: pauseDetector.delay(wait: config.fixOnPauseWait), pid: app.processIdentifier)
+    }
+
+    // Each key restarts the wait, so nothing runs while typing carries on.
+    private func schedulePauseFix(after delay: TimeInterval, pid: pid_t) {
+        pauseTimer?.cancel()
+        pauseTimer = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.pauseTimer = nil
+            self.pauseFix(pid: pid)
+        }
+    }
+
+    private func pauseFix(pid: pid_t) {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+        if isProcessing {
+            // A pause fix cancelled by the last key is still winding down; try again once it has.
+            if pauseFixTask != nil {
+                schedulePauseFix(after: 0.5, pid: pid)
+            }
+            return
+        }
+        if let lastPauseRequest, Date().timeIntervalSince(lastPauseRequest) < Self.pauseCooldown {
+            schedulePauseFix(after: Self.pauseCooldown - Date().timeIntervalSince(lastPauseRequest), pid: pid)
+            return
+        }
+        if let value = TextSelectionIO.focusedValue(), value == lastPauseValue {
+            return
+        }
+        isProcessing = true
+        lastPauseRequest = Date()
+        let style = RuntimeConfig.resolveStyle(id: config.autoFixStyleID, styles: config.styles)
+        logger.log("pausefix start", ["styleId": style.id, "medianMs": Int(pauseDetector.median * 1000), "delayMs": Int(pauseDetector.delay(wait: config.fixOnPauseWait) * 1000)])
+        pauseFixTask = Task { @MainActor in
+            do {
+                let outcome = try await runAutoFix(style: style, quiet: true)
+                // Only text a fix finished with counts as clean; a cancelled or dropped one was never checked.
+                lastPauseValue = TextSelectionIO.focusedValue()
+                if outcome == .fixed {
+                    pill.anchor = TextSelectionIO.caretAnchor()?.anchor
+                    pill.show("✓ Fixed", hideAfter: 1.2)
+                }
+            } catch is CancellationError {
+                logger.log("pausefix skipped", ["reason": "cancelled"])
+            } catch let error as URLError where error.code == .cancelled {
+                logger.log("pausefix skipped", ["reason": "cancelled"])
+            } catch {
+                // A pause never interrupts with an error panel; the hotkey reports problems.
+                logger.log("pausefix skipped", ["reason": "\(error)"])
+            }
+            pauseFixTask = nil
+            isProcessing = false
+        }
+    }
+
     // Only over a "Fixing…" pill already on screen: an early cancel has no caret position of its own.
     private func showCancelledPill() {
         guard pill.isVisible else { return }
@@ -3433,7 +3815,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         case skipped
     }
 
-    private func runAutoFix(style: StyleConfig) async throws -> AutoFixOutcome {
+    // `quiet`: a fix on pause shows no progress, never fixes a selection, and always tries the direct
+    // write first, since a select-all flash on every pause would get in the way of typing.
+    private func runAutoFix(style: StyleConfig, quiet: Bool = false) async throws -> AutoFixOutcome {
         if let app = NSWorkspace.shared.frontmostApplication?.bundleIdentifier, AutoFixTarget.terminalBundleIDs.contains(app) {
             logger.log("autofix skipped", ["app": app])
             return .skipped
@@ -3441,12 +3825,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         if config.provider.requiresAPIKey, CredentialStore.apiKey(for: config) == nil {
             throw FixitError.missingAPIKey(config.provider.label)
         }
-        let pointer = TextSelectionIO.caretAnchor()
-        logger.log("pill anchor", ["source": pointer?.source ?? "none"])
-        // Set even when nil, so a run without a caret doesn't point at the last run's.
-        pill.anchor = pointer?.anchor
-        pill.show("Fixing…")
-        let session = try await TextSelectionIO.captureForAutoFix()
+        if !quiet {
+            let pointer = TextSelectionIO.caretAnchor()
+            logger.log("pill anchor", ["source": pointer?.source ?? "none"])
+            // Set even when nil, so a run without a caret doesn't point at the last run's.
+            pill.anchor = pointer?.anchor
+            pill.show("Fixing…")
+        }
+        let session = try await TextSelectionIO.captureForAutoFix(wholeFieldOnly: quiet)
         let started = Date()
         let fixed = try await client.fix(text: session.originalText, systemPrompt: promptLoader.prompt(for: style))
         try Task.checkCancellation()
@@ -3456,7 +3842,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         guard TextSelectionIO.targetUnchanged(session) else { throw FixitError.targetChanged }
         // Unstructured like the paste below: a cancel mid-poll would skip its waits, report the write as
         // failed, and paste a second copy.
-        if config.replaceWithoutClipboard, await Task(operation: { @MainActor in
+        if config.replaceWithoutClipboard || quiet, await Task(operation: { @MainActor in
             await TextSelectionIO.replaceDirectly(with: result, in: session)
         }).value {
             logger.log("autofix write", ["method": "direct"])
@@ -3507,6 +3893,8 @@ final class AppController: NSObject, NSApplicationDelegate {
                   app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
             Task { @MainActor in
                 self?.lastTargetApp = app
+                // Leaving the app ends the pause; a fix couldn't write to it from the background anyway.
+                self?.pauseTimer?.cancel()
             }
         }
     }
@@ -3598,6 +3986,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         logger = Logger(enabled: config.debugLogging, configDir: config.configDir)
         promptLoader = PromptLoader(config: config)
         client = OpenAICompatibleClient(config: config)
+        updatePauseMonitor()
         let refused = registerHotKeys()
         settingsWindow?.reload(config: config)
         return refused
@@ -3650,6 +4039,10 @@ final class AppController: NSObject, NSApplicationDelegate {
             menu.addItem(menuItem)
         }
         menu.addItem(.separator())
+        let pauseItem = NSMenuItem(title: "Fix on Pause", action: #selector(togglePauseApp), keyEquivalent: "")
+        menu.addItem(pauseItem)
+        pauseToggleItem = pauseItem
+        menu.delegate = self
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Check Setup…", action: #selector(openOnboarding), keyEquivalent: ""))
         if updaterController != nil {
@@ -3659,6 +4052,35 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         item.menu = menu
         statusItem = item
+    }
+
+    // Names the app that was in front before the menu opened.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard let item = pauseToggleItem else { return }
+        guard let app = lastTargetApp, let bundleID = app.bundleIdentifier else {
+            item.isHidden = true
+            return
+        }
+        item.isHidden = false
+        item.title = "Fix on Pause in \(app.localizedName ?? NSWorkspace.shared.appName(bundleID: bundleID))"
+        item.state = config.fixOnPause && config.fixOnPauseApps.contains(bundleID) ? .on : .off
+    }
+
+    @objc private func togglePauseApp() {
+        guard let bundleID = lastTargetApp?.bundleIdentifier else { return }
+        var apps = config.fixOnPauseApps
+        if config.fixOnPause, apps.contains(bundleID) {
+            apps.removeAll { $0 == bundleID }
+        } else if !apps.contains(bundleID) {
+            apps.append(bundleID)
+        }
+        do {
+            try ConfigStore.setFixOnPauseApps(apps, configDir: config.configDir)
+            try reloadRuntime()
+            logger.log("pausefix apps", ["apps": apps.joined(separator: ",")])
+        } catch {
+            showAlert(title: "Couldn't Save", message: error.localizedDescription)
+        }
     }
 
     @objc private func styleMenuItemPressed(_ sender: NSMenuItem) {
