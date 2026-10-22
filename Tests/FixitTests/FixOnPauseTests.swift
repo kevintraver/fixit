@@ -47,6 +47,24 @@ import Testing
     }
 }
 
+@Suite struct WordCountTests {
+    @Test func countsWords() {
+        #expect(TypingPauseDetector.wordCount("ok") == 1)
+        #expect(TypingPauseDetector.wordCount("sounds good") == 2)
+        #expect(TypingPauseDetector.wordCount("  teh meeting\nis tomorow  ") == 4)
+    }
+
+    @Test func punctuationAndEmojiAloneArentWords() {
+        #expect(TypingPauseDetector.wordCount("ok 🎉 !") == 1)
+        #expect(TypingPauseDetector.wordCount("— …") == 0)
+        #expect(TypingPauseDetector.wordCount("") == 0)
+    }
+
+    @Test func numbersCount() {
+        #expect(TypingPauseDetector.wordCount("at 5pm") == 2)
+    }
+}
+
 @Suite struct CaretAtEndTests {
     private func atEnd(_ value: String, _ location: Int, length: Int = 0) -> Bool {
         AutoFixTarget.caretAtEnd(value: value, selection: NSRange(location: location, length: length))
@@ -188,5 +206,11 @@ import Testing
     @Test func outOfRangeWaitIsClamped() throws {
         let runtime = try RuntimeConfig.resolve(FixitConfig(fixOnPauseWait: 10), configDir: configDir, env: [:])
         #expect(runtime.fixOnPauseWait == TypingPauseDetector.waitRange.upperBound)
+    }
+
+    @Test func minimumWordsDefaultsAndClamps() throws {
+        #expect(try RuntimeConfig.resolve(FixitConfig(), configDir: configDir, env: [:]).fixOnPauseMinWords == 2)
+        #expect(try RuntimeConfig.resolve(FixitConfig(fixOnPauseMinWords: 0), configDir: configDir, env: [:]).fixOnPauseMinWords == 1)
+        #expect(try RuntimeConfig.resolve(FixitConfig(fixOnPauseMinWords: 99), configDir: configDir, env: [:]).fixOnPauseMinWords == 10)
     }
 }
