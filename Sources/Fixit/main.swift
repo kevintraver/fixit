@@ -146,6 +146,8 @@ struct FixitConfig: Codable {
     var fixOnPauseApps: [String]?
     // Seconds to wait after typing stops, before scaling for rhythm and sentence ends.
     let fixOnPauseWait: Double?
+    // Shorter text is left alone on a pause: "ok" is usually meant as is.
+    let fixOnPauseMinWords: Int?
     let provider: String?
     let model: String?
     let endpoint: String?
@@ -168,6 +170,7 @@ struct FixitConfig: Codable {
         fixOnPause: Bool? = nil,
         fixOnPauseApps: [String]? = nil,
         fixOnPauseWait: Double? = nil,
+        fixOnPauseMinWords: Int? = nil,
         provider: String? = nil,
         model: String? = nil,
         endpoint: String? = nil,
@@ -188,6 +191,7 @@ struct FixitConfig: Codable {
         self.fixOnPause = fixOnPause
         self.fixOnPauseApps = fixOnPauseApps
         self.fixOnPauseWait = fixOnPauseWait
+        self.fixOnPauseMinWords = fixOnPauseMinWords
         self.provider = provider
         self.model = model
         self.endpoint = endpoint
@@ -214,6 +218,7 @@ struct RuntimeConfig {
     let fixOnPause: Bool
     let fixOnPauseApps: [String]
     let fixOnPauseWait: TimeInterval
+    let fixOnPauseMinWords: Int
     let provider: Provider
     let model: String
     let baseURL: URL
@@ -291,6 +296,7 @@ struct RuntimeConfig {
             fixOnPause: config.fixOnPause ?? false,
             fixOnPauseApps: config.fixOnPauseApps ?? [],
             fixOnPauseWait: config.fixOnPauseWait.map { min(max($0, TypingPauseDetector.waitRange.lowerBound), TypingPauseDetector.waitRange.upperBound) } ?? TypingPauseDetector.defaultWait,
+            fixOnPauseMinWords: config.fixOnPauseMinWords.map { min(max($0, TypingPauseDetector.minWordsRange.lowerBound), TypingPauseDetector.minWordsRange.upperBound) } ?? TypingPauseDetector.defaultMinWords,
             provider: provider,
             model: model,
             baseURL: baseURL,
@@ -328,6 +334,7 @@ struct RuntimeConfig {
             fixOnPause: false,
             fixOnPauseApps: [],
             fixOnPauseWait: TypingPauseDetector.defaultWait,
+            fixOnPauseMinWords: TypingPauseDetector.defaultMinWords,
             provider: provider,
             model: provider.defaultModel,
             baseURL: provider.defaultEndpoint.flatMap(URL.init(string:)) ?? URL(fileURLWithPath: "/"),
@@ -817,7 +824,7 @@ struct CLIParser {
 enum ConfigStore {
     // Auto-fix stays off without a key, and its modifiers are only written with one. Its style is also
     // written when picked away from the default, so the choice survives until a key is set.
-    static func save(config: RuntimeConfig, styles: [StyleConfig], pickerKey: String?, pickerModifiers: [String]?, autoFixKey: String?, autoFixModifiers: [String]?, autoFixStyle: String?, replaceWithoutClipboard: Bool, fixOnPause: Bool, fixOnPauseApps: [String], fixOnPauseWait: TimeInterval, prompts: [String: String], provider: Provider, model: String?, endpoint: String?) throws {
+    static func save(config: RuntimeConfig, styles: [StyleConfig], pickerKey: String?, pickerModifiers: [String]?, autoFixKey: String?, autoFixModifiers: [String]?, autoFixStyle: String?, replaceWithoutClipboard: Bool, fixOnPause: Bool, fixOnPauseApps: [String], fixOnPauseWait: TimeInterval, fixOnPauseMinWords: Int, prompts: [String: String], provider: Provider, model: String?, endpoint: String?) throws {
         try FileManager.default.createDirectory(at: config.configDir, withIntermediateDirectories: true)
         for (relativePath, prompt) in prompts {
             let url = config.configDir.appendingPathComponent(relativePath)
@@ -839,6 +846,7 @@ enum ConfigStore {
             fixOnPause: fixOnPause ? true : nil,
             fixOnPauseApps: fixOnPauseApps.isEmpty ? nil : fixOnPauseApps,
             fixOnPauseWait: fixOnPauseWait == TypingPauseDetector.defaultWait ? nil : fixOnPauseWait,
+            fixOnPauseMinWords: fixOnPauseMinWords == TypingPauseDetector.defaultMinWords ? nil : fixOnPauseMinWords,
             provider: provider.rawValue,
             model: model,
             // Keep a hand-edited endpoint override when the provider didn't change.
@@ -940,6 +948,7 @@ struct SetupDraft {
             fixOnPause: existing.fixOnPause,
             fixOnPauseApps: existing.fixOnPauseApps,
             fixOnPauseWait: existing.fixOnPauseWait,
+            fixOnPauseMinWords: existing.fixOnPauseMinWords,
             provider: keepsProvider ? existing.provider : provider.rawValue,
             model: keepsProvider ? existing.model : nil,
             endpoint: keepsProvider ? existing.endpoint : nil,
@@ -1327,6 +1336,15 @@ struct TypingPauseDetector {
     // The user's "Wait after typing" setting, in seconds.
     static let waitRange: ClosedRange<TimeInterval> = 0.1...3
     static let defaultWait: TimeInterval = 1
+    // The "Minimum length" setting, in words.
+    static let minWordsRange: ClosedRange<Int> = 1...10
+    static let defaultMinWords = 2
+
+    /// Words in `text`: whitespace-separated runs with a letter or digit, so stray punctuation and emoji
+    /// don't count.
+    static func wordCount(_ text: String) -> Int {
+        text.split(whereSeparator: \.isWhitespace).filter { $0.contains { $0.isLetter || $0.isNumber } }.count
+    }
 
     func delay(wait: TimeInterval) -> TimeInterval { Self.delay(median: median, after: lastKind, wait: wait) }
 
@@ -2419,6 +2437,8 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
     private let fixOnPauseCheckbox = NSButton(checkboxWithTitle: "Fix automatically when I pause typing", target: nil, action: nil)
     private let pauseDelaySlider = NSSlider()
     private let pauseDelayLabel = NSTextField(labelWithString: "")
+    private let minWordsStepper = NSStepper()
+    private let minWordsLabel = NSTextField(labelWithString: "")
     private let pauseAppsTable = NSTableView()
     private let pauseAppsControl = NSSegmentedControl()
     private var pauseAppDrafts: [String] = []
@@ -2475,6 +2495,8 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         fixOnPauseCheckbox.state = config.fixOnPause ? .on : .off
         pauseDelaySlider.doubleValue = config.fixOnPauseWait
         pauseDelayChanged()
+        minWordsStepper.integerValue = config.fixOnPauseMinWords
+        minWordsChanged()
         pauseAppDrafts = config.fixOnPauseApps
         pauseAppsTable.reloadData()
         statusLabel.stringValue = "API keys, shortcuts, and prompts are stored in \(config.configDir.path)."
@@ -2674,16 +2696,30 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         pauseDelayRow.orientation = .horizontal
         pauseDelayRow.spacing = 8
         pauseDelaySlider.widthAnchor.constraint(equalToConstant: 200).isActive = true
-        let pauseDelayGrid = formGrid([[formLabel("Wait after typing:"), pauseDelayRow]])
-        pauseDelayGrid.cell(for: pauseDelayRow)?.xPlacement = .leading
         let pauseDelayHelp = secondaryLabel("About half as long after a finished sentence, and longer if you type slowly.")
+        minWordsStepper.minValue = Double(TypingPauseDetector.minWordsRange.lowerBound)
+        minWordsStepper.maxValue = Double(TypingPauseDetector.minWordsRange.upperBound)
+        minWordsStepper.increment = 1
+        minWordsStepper.target = self
+        minWordsStepper.action = #selector(minWordsChanged)
+        let minWordsRow = NSStackView(views: [minWordsStepper, minWordsLabel])
+        minWordsRow.orientation = .horizontal
+        minWordsRow.spacing = 6
+        let pauseDelayGrid = formGrid([
+            [formLabel("Wait after typing:"), pauseDelayRow],
+            [NSGridCell.emptyContentView, pauseDelayHelp],
+            [formLabel("Minimum length:"), minWordsRow],
+        ])
+        pauseDelayGrid.cell(for: pauseDelayRow)?.xPlacement = .leading
+        pauseDelayGrid.cell(for: minWordsRow)?.xPlacement = .leading
+        minWordsRow.toolTip = "Text with fewer words is left as typed on a pause, like a quick \"ok\". The shortcut still fixes any length."
 
         let pauseAppsLabel = NSTextField(labelWithString: "Apps:")
         pauseAppsLabel.translatesAutoresizingMaskIntoConstraints = false
         let pauseAppsScroll = listTable(pauseAppsTable)
         addRemoveButtons(pauseAppsControl, noun: "app", action: #selector(pauseAppsControlPressed(_:)))
 
-        for view in [autoFixHelp, autoFixGrid, pauseSeparator, pauseHeader, pauseHelp, fixOnPauseCheckbox, pauseDelayGrid, pauseDelayHelp, pauseAppsLabel, pauseAppsScroll, pauseAppsControl] {
+        for view in [autoFixHelp, autoFixGrid, pauseSeparator, pauseHeader, pauseHelp, fixOnPauseCheckbox, pauseDelayGrid, pauseAppsLabel, pauseAppsScroll, pauseAppsControl] {
             autoFix.addSubview(view)
         }
 
@@ -2790,11 +2826,9 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             fixOnPauseCheckbox.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: fieldColumn),
             pauseDelayGrid.topAnchor.constraint(equalTo: fixOnPauseCheckbox.bottomAnchor, constant: 10),
             pauseDelayGrid.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: inset),
+            pauseDelayGrid.trailingAnchor.constraint(equalTo: autoFix.trailingAnchor, constant: -inset),
             pauseDelaySlider.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: fieldColumn),
-            pauseDelayHelp.topAnchor.constraint(equalTo: pauseDelayGrid.bottomAnchor, constant: 4),
-            pauseDelayHelp.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: fieldColumn),
-            pauseDelayHelp.trailingAnchor.constraint(equalTo: autoFix.trailingAnchor, constant: -inset),
-            pauseAppsScroll.topAnchor.constraint(equalTo: pauseDelayHelp.bottomAnchor, constant: 12),
+            pauseAppsScroll.topAnchor.constraint(equalTo: pauseDelayGrid.bottomAnchor, constant: 12),
             pauseAppsScroll.leadingAnchor.constraint(equalTo: autoFix.leadingAnchor, constant: fieldColumn),
             pauseAppsScroll.widthAnchor.constraint(equalToConstant: 260),
             pauseAppsLabel.topAnchor.constraint(equalTo: pauseAppsScroll.topAnchor, constant: 2),
@@ -2834,6 +2868,11 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
 
     @objc private func pauseDelayChanged() {
         pauseDelayLabel.stringValue = String(format: "%.1f s", pauseDelaySlider.doubleValue)
+    }
+
+    @objc private func minWordsChanged() {
+        let words = minWordsStepper.integerValue
+        minWordsLabel.stringValue = words == 1 ? "1 word" : "\(words) words"
     }
 
     // Edits, like everything here, only take effect on Save.
@@ -3067,6 +3106,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
                 fixOnPause: fixOnPauseCheckbox.state == .on,
                 fixOnPauseApps: pauseAppDrafts,
                 fixOnPauseWait: (pauseDelaySlider.doubleValue * 10).rounded() / 10,
+                fixOnPauseMinWords: minWordsStepper.integerValue,
                 prompts: prompts,
                 provider: provider,
                 model: model.isEmpty ? nil : model,
@@ -3843,9 +3883,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             logger.log("pausefix skipped", ["reason": "caret not at end", "caret": position.caret.location, "selected": position.caret.length, "length": position.length])
             return
         }
-        if let value = TextSelectionIO.focusedValue(), value == lastPauseValue {
-            logger.log("pausefix skipped", ["reason": "unchanged since last fix"])
-            return
+        if let value = TextSelectionIO.focusedValue() {
+            if value == lastPauseValue {
+                logger.log("pausefix skipped", ["reason": "unchanged since last fix"])
+                return
+            }
+            // Fields whose text can't be read skip this check; the copy fallback still guards blank ones.
+            let words = TypingPauseDetector.wordCount(value)
+            if words < config.fixOnPauseMinWords {
+                logger.log("pausefix skipped", ["reason": "too short", "words": words])
+                return
+            }
         }
         isProcessing = true
         let style = RuntimeConfig.resolveStyle(id: config.autoFixStyleID, styles: config.styles)
