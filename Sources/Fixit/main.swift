@@ -3843,61 +3843,71 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Moving around without having typed has nothing to fix. A move to the end after an edit
             // earlier in the text restarts the wait; the fix still checks the caret is at the end.
             guard editedApp == app.processIdentifier else { return }
-            logger.log("pausefix caret moved")
-            schedulePauseFix(after: pauseDetector.delay(wait: config.fixOnPauseWait), pid: app.processIdentifier)
+            schedulePauseFix(after: pauseDetector.delay(wait: config.fixOnPauseWait), app: app, trigger: "caret moved")
             return
         }
         editedApp = app.processIdentifier
         pauseDetector.record(kind, at: Date())
         // The field is changing under any fix in flight, so its write would be dropped anyway.
         pauseFixTask?.cancel()
-        schedulePauseFix(after: pauseDetector.delay(wait: config.fixOnPauseWait), pid: app.processIdentifier)
+        schedulePauseFix(after: pauseDetector.delay(wait: config.fixOnPauseWait), app: app, trigger: kind == .sentenceEnd ? "sentence end" : "typing")
     }
 
-    // Each key restarts the wait, so nothing runs while typing carries on.
-    private func schedulePauseFix(after delay: TimeInterval, pid: pid_t) {
+    // Each key restarts the wait, so nothing runs while typing carries on. `trigger` says what started the
+    // wait, for the log.
+    private func schedulePauseFix(after delay: TimeInterval, app: NSRunningApplication, trigger: String) {
         pauseTimer?.cancel()
         pauseTimer = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
             self.pauseTimer = nil
-            self.pauseFix(pid: pid)
+            self.pauseFix(app: app, trigger: trigger)
         }
     }
 
-    private func pauseFix(pid: pid_t) {
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+    // Each pause logs one `pausefix` line with how it ended, the app and what set it off; never the text.
+    private func pauseFix(app: NSRunningApplication, trigger: String) {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
         if isProcessing {
             // A pause fix cancelled by the last key is still winding down; try again once it has.
             if pauseFixTask != nil {
-                schedulePauseFix(after: 0.5, pid: pid)
+                schedulePauseFix(after: 0.5, app: app, trigger: trigger)
             }
             return
         }
         if let lastPauseFinished, Date().timeIntervalSince(lastPauseFinished) < Self.pauseCooldown {
-            schedulePauseFix(after: Self.pauseCooldown - Date().timeIntervalSince(lastPauseFinished), pid: pid)
+            schedulePauseFix(after: Self.pauseCooldown - Date().timeIntervalSince(lastPauseFinished), app: app, trigger: trigger)
             return
+        }
+        var details: [String: Any] = [
+            "app": app.bundleIdentifier ?? "",
+            "trigger": trigger,
+            "delayMs": Int(pauseDetector.delay(wait: config.fixOnPauseWait) * 1000),
+        ]
+        func log(_ outcome: String, _ extra: [String: Any] = [:]) {
+            logger.log("pausefix \(outcome)", details.merging(extra) { _, new in new })
         }
         // Back in the text to edit it: a fix now could rewrite what's being changed, so that's the hotkey's job.
         if let position = TextSelectionIO.caretPosition(), !position.atEnd {
-            logger.log("pausefix skipped", ["reason": "caret not at end", "caret": position.caret.location, "selected": position.caret.length, "length": position.length])
+            log("skipped", ["reason": "caret not at end", "caret": position.caret.location, "selected": position.caret.length, "length": position.length])
             return
         }
         if let value = TextSelectionIO.focusedValue() {
+            let words = TypingPauseDetector.wordCount(value)
+            details["words"] = words
             if value == lastPauseValue {
-                logger.log("pausefix skipped", ["reason": "unchanged since last fix"])
+                log("skipped", ["reason": "unchanged since last fix"])
                 return
             }
             // Fields whose text can't be read skip this check; the copy fallback still guards blank ones.
-            let words = TypingPauseDetector.wordCount(value)
             if words < config.fixOnPauseMinWords {
-                logger.log("pausefix skipped", ["reason": "too short", "words": words])
+                log("skipped", ["reason": "too short"])
                 return
             }
         }
         isProcessing = true
         let style = RuntimeConfig.resolveStyle(id: config.autoFixStyleID, styles: config.styles)
-        logger.log("pausefix start", ["styleId": style.id, "medianMs": Int(pauseDetector.median * 1000), "delayMs": Int(pauseDetector.delay(wait: config.fixOnPauseWait) * 1000)])
+        let started = Date()
         pauseFixTask = Task { @MainActor in
             do {
                 let outcome = try await runAutoFix(style: style, quiet: true)
@@ -3905,24 +3915,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 lastPauseValue = TextSelectionIO.focusedValue()
                 editedApp = nil
                 lastPauseFinished = Date()
+                log(outcome == .fixed ? "fixed" : "unchanged", ["ms": Int(Date().timeIntervalSince(started) * 1000)])
                 if outcome == .fixed {
                     pill.anchor = TextSelectionIO.caretAnchor()?.anchor
                     pill.show("✓ Fixed", hideAfter: 1.2)
                 }
             } catch is CancellationError {
-                logger.log("pausefix skipped", ["reason": "cancelled"])
+                log("cancelled")
             } catch let error as URLError where error.code == .cancelled {
-                logger.log("pausefix skipped", ["reason": "cancelled"])
+                log("cancelled")
             } catch FixitError.targetChanged {
                 // Typing carried on during the request; the next pause picks it up.
-                logger.log("pausefix skipped", ["reason": "text changed"])
+                log("skipped", ["reason": "text changed"])
             } catch FixitError.noSelection {
-                logger.log("pausefix skipped", ["reason": "blank"])
+                log("skipped", ["reason": "blank"])
+            } catch FixitError.notEditable {
+                log("skipped", ["reason": "not a text field"])
             } catch {
                 // A pause never interrupts with an error panel; the hotkey reports problems. A failing
                 // provider still gets the cooldown, so it isn't retried on every pause.
                 lastPauseFinished = Date()
-                logger.log("pausefix skipped", ["reason": "\(error)"])
+                log("failed", ["reason": "\(error)"])
             }
             pauseFixTask = nil
             isProcessing = false
