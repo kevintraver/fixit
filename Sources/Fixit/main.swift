@@ -3900,12 +3900,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
             self.pauseTimer = nil
-            self.pauseFix(app: app, trigger: trigger)
+            self.pauseFix(app: app, trigger: trigger, waited: delay)
         }
     }
 
     // Each pause logs one `pausefix` line with how it ended, the app and what set it off; never the text.
-    private func pauseFix(app: NSRunningApplication, trigger: String) {
+    // `waited`: the wait that just ended, which after an app switch or cooldown isn't the typing delay.
+    private func pauseFix(app: NSRunningApplication, trigger: String, waited: TimeInterval) {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {
             // Picked back up on switching back. `front` names what took over, which may be a panel or
             // overlay that didn't take the keyboard.
@@ -3930,7 +3931,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var details: [String: Any] = [
             "app": app.bundleIdentifier ?? "",
             "trigger": trigger,
-            "delayMs": Int(pauseDetector.delay(wait: config.fixOnPauseWait) * 1000),
+            "delayMs": Int(waited * 1000),
         ]
         func log(_ outcome: String, _ extra: [String: Any] = [:]) {
             logger.log("pausefix \(outcome)", details.merging(extra) { _, new in new })
