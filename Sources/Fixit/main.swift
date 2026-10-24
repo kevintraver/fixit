@@ -1510,22 +1510,43 @@ enum TextSelectionIO {
     /// Where the caret is in the frontmost app's focused field, and whether that's the end of its text;
     /// nil when the app doesn't report the text or the caret.
     @MainActor
-    static func caretPosition() -> (atEnd: Bool, caret: NSRange, length: Int)? {
+    static func caretPosition() -> (atEnd: Bool, caret: NSRange, length: Int, after: [String])? {
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
               let element = focusedElement(of: app) else { return nil }
         let snapshot = fieldSnapshot(of: element)
         guard let value = snapshot.value, let selection = snapshot.selection else { return nil }
-        return (AutoFixTarget.caretAtEnd(value: value, selection: selection), selection, value.utf16.count)
+        // Code points of the first few characters after the caret, for logging what an app reports there.
+        let utf16 = Array(value.utf16)
+        let tail = selection.location < utf16.count ? String(decoding: utf16[selection.location...], as: UTF16.self) : ""
+        let after = tail.unicodeScalars.prefix(3).map { String(format: "U+%04X", $0.value) }
+        return (AutoFixTarget.caretAtEnd(value: value, selection: selection), selection, value.utf16.count, after)
     }
 
     /// The frontmost app's focused field text as Accessibility reports it, without copying anything.
     @MainActor
     static func focusedValue() -> String? {
+        focusedField()?.value
+    }
+
+    /// The frontmost app's focused element: its role, and its text when it has any. `label` is its
+    /// accessibility label or placeholder (like "Search"), for logging which field it was; never typed text.
+    @MainActor
+    static func focusedField() -> (role: String?, value: String?, label: String?)? {
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
               let element = focusedElement(of: app) else { return nil }
-        return fieldSnapshot(of: element).value
+        let label = [kAXDescriptionAttribute, "AXPlaceholderValue", kAXTitleAttribute]
+            .lazy.compactMap { attribute(element, $0) as? String }.first { !$0.isEmpty }
+        return (attribute(element, kAXRoleAttribute) as? String, fieldSnapshot(of: element).value, label)
+    }
+
+    /// Whether the field a fix read still holds the same text, wherever focus is now. Only for fields read
+    /// directly, which can be written directly too.
+    @MainActor
+    static func textUnchanged(_ session: TextTargetSession) -> Bool {
+        guard let element = session.focusedElement, let captured = session.fieldSnapshot?.value else { return false }
+        return fieldSnapshot(of: element).value == captured
     }
 
     /// False when focus moved or the field changed since capture, so writing would clobber something else.
@@ -3634,8 +3655,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pauseToggleItem: NSMenuItem?
     // Fix on pause: a key monitor feeds the detector, whose delay debounces a timer that runs the fix.
     private var pauseMonitors: [Any] = []
-    // The app typed in since the last pause fix; only then does moving the caret pick the pause back up.
-    private var editedApp: pid_t?
+    // Apps typed in since their last pause fix; only there do caret moves and switching back pick the
+    // pause back up.
+    private var editedApps: Set<pid_t> = []
     private var pauseMonitorWait: Task<Void, Never>?
     private var pauseDetector = TypingPauseDetector()
     private var pauseTimer: Task<Void, Never>?
@@ -3645,6 +3667,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastPauseFinished: Date?
     // The field text a pause fix last left clean, so pausing again without typing doesn't call the model.
     private var lastPauseValue: String?
+    // Wait after switching back into an app before checking its field.
+    private static let switchBackDelay: TimeInterval = 1
     // Rest after a finished pause fix before the next one.
     private static let pauseCooldown: TimeInterval = 1
 
@@ -3802,6 +3826,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // so wait for the grant first.
             guard AXIsProcessTrusted() else {
                 if pauseMonitorWait == nil {
+                    logger.log("pausefix waiting for accessibility")
                     pauseMonitorWait = Task { @MainActor [weak self] in
                         while !AXIsProcessTrusted() {
                             try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -3827,6 +3852,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             pauseMonitors = [keys, clicks].compactMap { $0 }
+            logger.log("pausefix listening", ["monitors": pauseMonitors.count])
         } else if !enabled {
             pauseMonitorWait?.cancel()
             pauseMonitorWait = nil
@@ -3842,15 +3868,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if kind == .navigation {
             // Moving around without having typed has nothing to fix. A move to the end after an edit
             // earlier in the text restarts the wait; the fix still checks the caret is at the end.
-            guard editedApp == app.processIdentifier else { return }
+            guard editedApps.contains(app.processIdentifier) else { return }
             schedulePauseFix(after: pauseDetector.delay(wait: config.fixOnPauseWait), app: app, trigger: "caret moved")
             return
         }
-        editedApp = app.processIdentifier
+        editedApps.insert(app.processIdentifier)
         pauseDetector.record(kind, at: Date())
         // The field is changing under any fix in flight, so its write would be dropped anyway.
         pauseFixTask?.cancel()
         schedulePauseFix(after: pauseDetector.delay(wait: config.fixOnPauseWait), app: app, trigger: kind == .sentenceEnd ? "sentence end" : "typing")
+    }
+
+    // Coming back to an app typed in before leaving picks its pause back up, as moving the caret does. A pause
+    // that comes due while another app is in front does nothing, so leaving needs no cancel; cancelling here
+    // would also race the click that brought the app back.
+    private func pauseAppActivated(_ app: NSRunningApplication) {
+        guard let bundleID = app.bundleIdentifier, config.fixOnPauseApps.contains(bundleID) else { return }
+        guard editedApps.contains(app.processIdentifier) else {
+            logger.log("pausefix skipped", ["app": bundleID, "trigger": "app switch", "reason": "no typing since its last fix or since Fixit started"])
+            return
+        }
+        // Apps take a moment to put focus back in the field they had.
+        schedulePauseFix(after: max(pauseDetector.delay(wait: config.fixOnPauseWait), Self.switchBackDelay), app: app, trigger: "app switch")
     }
 
     // Each key restarts the wait, so nothing runs while typing carries on. `trigger` says what started the
@@ -3867,15 +3906,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Each pause logs one `pausefix` line with how it ended, the app and what set it off; never the text.
     private func pauseFix(app: NSRunningApplication, trigger: String) {
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {
+            // Picked back up on switching back. `front` names what took over, which may be a panel or
+            // overlay that didn't take the keyboard.
+            logger.log("pausefix skipped", ["app": app.bundleIdentifier ?? "", "trigger": trigger, "reason": "app not in front", "front": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "none"])
+            return
+        }
         if isProcessing {
             // A pause fix cancelled by the last key is still winding down; try again once it has.
             if pauseFixTask != nil {
+                logger.log("pausefix deferred", ["app": app.bundleIdentifier ?? "", "trigger": trigger, "reason": "previous fix still finishing"])
                 schedulePauseFix(after: 0.5, app: app, trigger: trigger)
+            } else {
+                logger.log("pausefix skipped", ["app": app.bundleIdentifier ?? "", "trigger": trigger, "reason": "shortcut fix running"])
             }
             return
         }
         if let lastPauseFinished, Date().timeIntervalSince(lastPauseFinished) < Self.pauseCooldown {
+            logger.log("pausefix deferred", ["app": app.bundleIdentifier ?? "", "trigger": trigger, "reason": "cooldown"])
             schedulePauseFix(after: Self.pauseCooldown - Date().timeIntervalSince(lastPauseFinished), app: app, trigger: trigger)
             return
         }
@@ -3889,21 +3937,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // Back in the text to edit it: a fix now could rewrite what's being changed, so that's the hotkey's job.
         if let position = TextSelectionIO.caretPosition(), !position.atEnd {
-            log("skipped", ["reason": "caret not at end", "caret": position.caret.location, "selected": position.caret.length, "length": position.length])
+            log("skipped", ["reason": "caret not at end", "caret": position.caret.location, "selected": position.caret.length, "length": position.length, "after": position.after.joined(separator: " ")])
             return
         }
-        if let value = TextSelectionIO.focusedValue() {
-            let words = TypingPauseDetector.wordCount(value)
-            details["words"] = words
-            if value == lastPauseValue {
-                log("skipped", ["reason": "unchanged since last fix"])
-                return
-            }
-            // Fields whose text can't be read skip this check; the copy fallback still guards blank ones.
-            if words < config.fixOnPauseMinWords {
-                log("skipped", ["reason": "too short"])
-                return
-            }
+        // Nothing readable in focus, like a conversation list while an app restores focus after a switch.
+        // The copy fallback would select all of it, so a pause leaves that to the hotkey.
+        let field = TextSelectionIO.focusedField()
+        guard let value = field?.value else {
+            log("skipped", ["reason": "no readable field", "role": field?.role ?? "none", "label": field?.label ?? ""])
+            return
+        }
+        let words = TypingPauseDetector.wordCount(value)
+        details["words"] = words
+        if value == lastPauseValue {
+            log("skipped", ["reason": "unchanged since last fix"])
+            return
+        }
+        if words < config.fixOnPauseMinWords {
+            log("skipped", ["reason": "too short"])
+            return
         }
         isProcessing = true
         let style = RuntimeConfig.resolveStyle(id: config.autoFixStyleID, styles: config.styles)
@@ -3911,12 +3963,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pauseFixTask = Task { @MainActor in
             do {
                 let outcome = try await runAutoFix(style: style, quiet: true)
+                let inFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
                 // Only text a fix finished with counts as clean; a cancelled or dropped one was never checked.
-                lastPauseValue = TextSelectionIO.focusedValue()
-                editedApp = nil
+                // After switching away, the field in front isn't the one that was fixed.
+                lastPauseValue = inFront ? TextSelectionIO.focusedValue() : nil
+                editedApps.remove(app.processIdentifier)
                 lastPauseFinished = Date()
-                log(outcome == .fixed ? "fixed" : "unchanged", ["ms": Int(Date().timeIntervalSince(started) * 1000)])
-                if outcome == .fixed {
+                log(outcome == .fixed ? "fixed" : "unchanged", ["ms": Int(Date().timeIntervalSince(started) * 1000), "inFront": inFront])
+                if outcome == .fixed, inFront {
                     pill.anchor = TextSelectionIO.caretAnchor()?.anchor
                     pill.show("✓ Fixed", hideAfter: 1.2)
                 }
@@ -3925,8 +3979,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } catch let error as URLError where error.code == .cancelled {
                 log("cancelled")
             } catch FixitError.targetChanged {
-                // Typing carried on during the request; the next pause picks it up.
-                log("skipped", ["reason": "text changed"])
+                // Typing carried on during the request, or the app was left before a write could land
+                // there; the next pause, or switching back, picks it up.
+                let inFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+                log("skipped", ["reason": inFront ? "text changed" : "switched away"])
             } catch FixitError.noSelection {
                 log("skipped", ["reason": "blank"])
             } catch FixitError.notEditable {
@@ -3979,7 +4035,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let result = fixed.text.withOuterWhitespace(of: session.originalText)
         logger.log("autofix complete", ["mode": session.replacesWholeField ? "field" : "selection", "accessibility": session.focusedElement != nil, "app": session.sourceApp?.bundleIdentifier ?? "", "durationMs": Int(Date().timeIntervalSince(started) * 1000), "inputLength": session.originalText.count, "outputLength": result.count, "cost": fixed.cost ?? 0])
         guard result != session.originalText else { return .unchanged }
-        guard TextSelectionIO.targetUnchanged(session) else { throw FixitError.targetChanged }
+        guard TextSelectionIO.targetUnchanged(session) else {
+            // Switched away while a pause fix ran: a direct write still lands in the field it was read from,
+            // as long as its text hasn't changed. Pasting can't, since it types into whatever is in front.
+            if quiet, TextSelectionIO.textUnchanged(session), await Task(operation: { @MainActor in
+                await TextSelectionIO.replaceDirectly(with: result, in: session)
+            }).value {
+                logger.log("autofix write", ["method": "direct", "background": true])
+                return .fixed
+            }
+            throw FixitError.targetChanged
+        }
         // Unstructured like the paste below: a cancel mid-poll would skip its waits, report the write as
         // failed, and paste a second copy.
         if config.replaceWithoutClipboard || quiet, await Task(operation: { @MainActor in
@@ -4033,8 +4099,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
             Task { @MainActor in
                 self?.lastTargetApp = app
-                // Leaving the app ends the pause; a fix couldn't write to it from the background anyway.
-                self?.pauseTimer?.cancel()
+                self?.pauseAppActivated(app)
             }
         }
     }
