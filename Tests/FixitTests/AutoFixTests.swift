@@ -165,15 +165,15 @@ import Testing
         RuntimeConfig(
             configDir: configDir, debugLogging: false, styles: RuntimeConfig.defaultStyles,
             pickerKey: nil, pickerModifiers: nil, autoFixKey: nil, autoFixModifiers: nil, autoFixStyleID: nil,
-            replaceWithoutClipboard: false, fixOnPause: false, fixOnPauseApps: [], fixOnPauseWait: 1, fixOnPauseMinWords: 2, provider: .groq, model: "m", baseURL: URL(fileURLWithPath: "/"),
+            replaceWithoutClipboard: false, fixOnPause: false, fixOnPauseApps: [], fixOnPauseWait: 1, fixOnPauseMinWords: 2, saveFixHistory: false, provider: .groq, model: "m", baseURL: URL(fileURLWithPath: "/"),
             referer: nil, appTitle: "Fixit", apiKeyEnv: nil)
     }
 
-    private func save(autoFixKey: String? = nil, autoFixStyle: String = "native", replaceWithoutClipboard: Bool = false, fixOnPause: Bool = false, fixOnPauseApps: [String] = [], fixOnPauseWait: TimeInterval = TypingPauseDetector.defaultWait, fixOnPauseMinWords: Int = TypingPauseDetector.defaultMinWords) throws -> String {
+    private func save(autoFixKey: String? = nil, autoFixStyle: String = "native", replaceWithoutClipboard: Bool = false, fixOnPause: Bool = false, fixOnPauseApps: [String] = [], fixOnPauseWait: TimeInterval = TypingPauseDetector.defaultWait, fixOnPauseMinWords: Int = TypingPauseDetector.defaultMinWords, saveFixHistory: Bool = false) throws -> String {
         try ConfigStore.save(
             config: config, styles: RuntimeConfig.defaultStyles, pickerKey: "0", pickerModifiers: ["command", "shift"],
             autoFixKey: autoFixKey, autoFixModifiers: ["command", "shift"], autoFixStyle: autoFixStyle,
-            replaceWithoutClipboard: replaceWithoutClipboard, fixOnPause: fixOnPause, fixOnPauseApps: fixOnPauseApps, fixOnPauseWait: fixOnPauseWait, fixOnPauseMinWords: fixOnPauseMinWords, prompts: [:], provider: .groq, model: nil, endpoint: nil)
+            replaceWithoutClipboard: replaceWithoutClipboard, fixOnPause: fixOnPause, fixOnPauseApps: fixOnPauseApps, fixOnPauseWait: fixOnPauseWait, fixOnPauseMinWords: fixOnPauseMinWords, saveFixHistory: saveFixHistory, prompts: [:], provider: .groq, model: nil, endpoint: nil)
         return try String(contentsOf: configDir.appendingPathComponent("config.json"), encoding: .utf8)
     }
 
@@ -184,6 +184,7 @@ import Testing
         #expect(!json.contains("autoFix"))
         #expect(!json.contains("replaceWithoutClipboard"))
         #expect(!json.contains("fixOnPause"))
+        #expect(!json.contains("saveFixHistory"))
     }
 
     @Test func savesFixOnPauseWhenSet() throws {
@@ -193,6 +194,13 @@ import Testing
         #expect(saved.fixOnPauseApps == ["com.apple.MobileSMS"])
         #expect(saved.fixOnPauseWait == 0.7)
         #expect(saved.fixOnPauseMinWords == 4)
+    }
+
+    @Test func savesFixHistoryWhenOn() throws {
+        defer { try? FileManager.default.removeItem(at: configDir) }
+        let saved = try JSONDecoder().decode(FixitConfig.self, from: Data(save(saveFixHistory: true).utf8))
+        #expect(saved.saveFixHistory == true)
+        #expect(try RuntimeConfig.resolve(saved, configDir: configDir, env: [:]).saveFixHistory)
     }
 
     @Test func savesAutoFixWhenSet() throws {

@@ -148,6 +148,8 @@ struct FixitConfig: Codable {
     let fixOnPauseWait: Double?
     // Shorter text is left alone on a pause: "ok" is usually meant as is.
     let fixOnPauseMinWords: Int?
+    // Opt-in: saves each fix and what was done with it afterwards to history.jsonl, for tuning prompts.
+    let saveFixHistory: Bool?
     let provider: String?
     let model: String?
     let endpoint: String?
@@ -171,6 +173,7 @@ struct FixitConfig: Codable {
         fixOnPauseApps: [String]? = nil,
         fixOnPauseWait: Double? = nil,
         fixOnPauseMinWords: Int? = nil,
+        saveFixHistory: Bool? = nil,
         provider: String? = nil,
         model: String? = nil,
         endpoint: String? = nil,
@@ -192,6 +195,7 @@ struct FixitConfig: Codable {
         self.fixOnPauseApps = fixOnPauseApps
         self.fixOnPauseWait = fixOnPauseWait
         self.fixOnPauseMinWords = fixOnPauseMinWords
+        self.saveFixHistory = saveFixHistory
         self.provider = provider
         self.model = model
         self.endpoint = endpoint
@@ -219,6 +223,7 @@ struct RuntimeConfig {
     let fixOnPauseApps: [String]
     let fixOnPauseWait: TimeInterval
     let fixOnPauseMinWords: Int
+    let saveFixHistory: Bool
     let provider: Provider
     let model: String
     let baseURL: URL
@@ -293,6 +298,7 @@ struct RuntimeConfig {
             fixOnPauseApps: config.fixOnPauseApps ?? [],
             fixOnPauseWait: config.fixOnPauseWait.map { min(max($0, TypingPauseDetector.waitRange.lowerBound), TypingPauseDetector.waitRange.upperBound) } ?? TypingPauseDetector.defaultWait,
             fixOnPauseMinWords: config.fixOnPauseMinWords.map { min(max($0, TypingPauseDetector.minWordsRange.lowerBound), TypingPauseDetector.minWordsRange.upperBound) } ?? TypingPauseDetector.defaultMinWords,
+            saveFixHistory: config.saveFixHistory ?? false,
             provider: provider,
             model: model,
             baseURL: baseURL,
@@ -326,6 +332,7 @@ struct RuntimeConfig {
             fixOnPauseApps: [],
             fixOnPauseWait: TypingPauseDetector.defaultWait,
             fixOnPauseMinWords: TypingPauseDetector.defaultMinWords,
+            saveFixHistory: false,
             provider: provider,
             model: provider.defaultModel,
             baseURL: provider.defaultEndpoint.flatMap(URL.init(string:)) ?? URL(fileURLWithPath: "/"),
@@ -818,7 +825,7 @@ struct CLIParser {
 enum ConfigStore {
     // Auto-fix stays off without a key, and its modifiers are only written with one. Its style is also
     // written when picked away from the default, so the choice survives until a key is set.
-    static func save(config: RuntimeConfig, styles: [StyleConfig], pickerKey: String?, pickerModifiers: [String]?, autoFixKey: String?, autoFixModifiers: [String]?, autoFixStyle: String?, replaceWithoutClipboard: Bool, fixOnPause: Bool, fixOnPauseApps: [String], fixOnPauseWait: TimeInterval, fixOnPauseMinWords: Int, prompts: [String: String], provider: Provider, model: String?, endpoint: String?) throws {
+    static func save(config: RuntimeConfig, styles: [StyleConfig], pickerKey: String?, pickerModifiers: [String]?, autoFixKey: String?, autoFixModifiers: [String]?, autoFixStyle: String?, replaceWithoutClipboard: Bool, fixOnPause: Bool, fixOnPauseApps: [String], fixOnPauseWait: TimeInterval, fixOnPauseMinWords: Int, saveFixHistory: Bool, prompts: [String: String], provider: Provider, model: String?, endpoint: String?) throws {
         try FileManager.default.createDirectory(at: config.configDir, withIntermediateDirectories: true)
         for (relativePath, prompt) in prompts {
             let url = config.configDir.appendingPathComponent(relativePath)
@@ -841,6 +848,7 @@ enum ConfigStore {
             fixOnPauseApps: fixOnPauseApps.isEmpty ? nil : fixOnPauseApps,
             fixOnPauseWait: fixOnPauseWait == TypingPauseDetector.defaultWait ? nil : fixOnPauseWait,
             fixOnPauseMinWords: fixOnPauseMinWords == TypingPauseDetector.defaultMinWords ? nil : fixOnPauseMinWords,
+            saveFixHistory: saveFixHistory ? true : nil,
             provider: provider.rawValue,
             model: model,
             // Keep a hand-edited endpoint override when the provider didn't change.
@@ -943,6 +951,7 @@ struct SetupDraft {
             fixOnPauseApps: existing.fixOnPauseApps,
             fixOnPauseWait: existing.fixOnPauseWait,
             fixOnPauseMinWords: existing.fixOnPauseMinWords,
+            saveFixHistory: existing.saveFixHistory,
             provider: keepsProvider ? existing.provider : provider.rawValue,
             model: keepsProvider ? existing.model : nil,
             endpoint: keepsProvider ? existing.endpoint : nil,
@@ -1274,6 +1283,195 @@ enum AutoFixTarget: Equatable {
         }
         guard let value else { return .unreadable }
         return hasInlineImages ? .unknown : .field(value)
+    }
+}
+
+enum FixPath: String, Encodable {
+    case shortcut, pause, review
+}
+
+/// What became of a fix's text. `dropped`: the field changed while the model ran, so nothing was written.
+enum FixResult: String, Encodable {
+    case written, unchanged, dropped, shown
+}
+
+enum WriteMethod: String, Encodable {
+    case direct, paste
+}
+
+/// One fix as the history file keeps it. `refines` links a review panel refinement to the fix it refined.
+struct FixRecord: Encodable {
+    let type = "fix"
+    var id = UUID().uuidString
+    var at = Date()
+    let path: FixPath
+    let app: String?
+    // Nil for a custom instruction or refinement; the prompt holds the instruction.
+    let style: String?
+    let prompt: String
+    let provider: String
+    let model: String
+    let input: String
+    let output: String
+    let result: FixResult
+    let writeMethod: WriteMethod?
+    let ms: Int
+    var refines: String?
+}
+
+/// What was done with a fix in the review panel.
+struct OutcomeRecord: Encodable {
+    enum Outcome: String, Encodable {
+        case accepted, copied, dismissed, refined
+    }
+
+    let type = "outcome"
+    let id: String
+    var at = Date()
+    let outcome: Outcome
+    var instruction: String?
+}
+
+enum FollowUpEnd: String, Encodable {
+    case sent
+    case leftField = "left field"
+    case fixedAgain = "fixed again"
+    case idle
+    case quit
+}
+
+/// How the field changed after a fix, until following it ended. `final` is its last non-empty text,
+/// which is what was sent when it ended `sent`.
+struct FollowUpRecord: Encodable {
+    struct Version: Encodable, Equatable {
+        // Seconds after the fix.
+        let t: Double
+        let text: String
+    }
+
+    let type = "followup"
+    let id: String
+    let at: Date
+    let end: FollowUpEnd
+    let seconds: Int
+    let versions: [Version]
+    let undos: Int
+    let final: String?
+}
+
+/// Follows the field a fix went into, one observation at a time, until one of them ends it.
+struct FollowUp {
+    enum Observation {
+        // The followed field has focus in the app in front. Nil when the app doesn't report its text.
+        case text(String?, at: Date)
+        case otherField(at: Date)
+        // Its app isn't in front. Following waits for it to come back.
+        case away(at: Date)
+        case undo(at: Date)
+        case refixed(at: Date)
+        case quit(at: Date)
+
+        var at: Date {
+            switch self {
+            case .text(_, let at), .otherField(let at), .away(let at), .undo(let at), .refixed(let at), .quit(let at): at
+            }
+        }
+    }
+
+    static let idleLimit: TimeInterval = 5 * 60
+
+    let fixID: String
+    let start: Date
+    private var lastChange: Date
+    private var lastText: String?
+    private var lastNonEmpty: String?
+    private var versions: [FollowUpRecord.Version] = []
+    private var undos = 0
+
+    /// `text`: the field's text when following starts.
+    init(fixID: String, start: Date, text: String?) {
+        self.fixID = fixID
+        self.start = start
+        lastChange = start
+        lastText = text
+        lastNonEmpty = text.flatMap { Self.isBlank($0) ? nil : $0 }
+    }
+
+    mutating func observe(_ observation: Observation) -> FollowUpEnd? {
+        switch observation {
+        case .text(let text, let at):
+            if let text, text != lastText {
+                if Self.isBlank(text) {
+                    // Chat apps clear the field when a message is sent.
+                    if let lastText, !Self.isBlank(lastText) { return .sent }
+                } else {
+                    versions.append(FollowUpRecord.Version(t: (at.timeIntervalSince(start) * 10).rounded() / 10, text: text))
+                    lastNonEmpty = text
+                }
+                lastText = text
+                lastChange = at
+            }
+            return idle(at: at)
+        case .away(let at):
+            return idle(at: at)
+        case .otherField:
+            return .leftField
+        case .undo:
+            undos += 1
+            return nil
+        case .refixed:
+            return .fixedAgain
+        case .quit:
+            return .quit
+        }
+    }
+
+    func record(_ end: FollowUpEnd, at: Date) -> FollowUpRecord {
+        FollowUpRecord(id: fixID, at: at, end: end, seconds: Int(at.timeIntervalSince(start).rounded()), versions: versions, undos: undos, final: lastNonEmpty)
+    }
+
+    private func idle(at: Date) -> FollowUpEnd? {
+        at.timeIntervalSince(lastChange) >= Self.idleLimit ? .idle : nil
+    }
+
+    private static func isBlank(_ text: String) -> Bool {
+        AutoFixTarget.isBlank(value: text, placeholder: nil, classList: [])
+    }
+}
+
+/// The opt-in fix history: one JSON record per line, appended as it happens, so a crash loses at most
+/// the follow-up in progress.
+final class FixHistory {
+    let url: URL
+    let enabled: Bool
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }()
+
+    init(configDir: URL, enabled: Bool) {
+        url = configDir.appendingPathComponent("history.jsonl")
+        self.enabled = enabled
+    }
+
+    func append(_ record: some Encodable) {
+        guard enabled, var line = try? encoder.encode(record) else { return }
+        line.append(0x0A)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+        }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: line)
+    }
+
+    func clear() {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? Data().write(to: url)
     }
 }
 
@@ -1720,7 +1918,20 @@ enum TextSelectionIO {
         return session
     }
 
-    private static func focusedElement(of app: NSRunningApplication) -> AXUIElement? {
+    /// A followed field's text for its fix's follow-up: empty when the field reads as blank, which for
+    /// some editors means a placeholder or a `ql-blank` class rather than no value.
+    @MainActor
+    static func followedText(of element: AXUIElement) -> String? {
+        let value = fieldSnapshot(of: element).value
+        let blank = AutoFixTarget.isBlank(
+            value: value,
+            placeholder: attribute(element, "AXPlaceholderValue") as? String,
+            classList: attribute(element, "AXDOMClassList") as? [String] ?? []
+        )
+        return blank ? "" : value
+    }
+
+    static func focusedElement(of app: NSRunningApplication) -> AXUIElement? {
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
         // Electron apps only build their accessibility tree once an assistive app asks for it.
         AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
@@ -2474,6 +2685,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
     private let autoFixShortcutField = NSTextField()
     private let autoFixStylePopup = NSPopUpButton()
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Launch Fixit at login", target: nil, action: nil)
+    private let saveHistoryCheckbox = NSButton(checkboxWithTitle: "Save fix history on this Mac", target: nil, action: nil)
     private let replaceWithoutClipboardCheckbox = NSButton(checkboxWithTitle: "Auto-fix without the clipboard (experimental)", target: nil, action: nil)
     private let fixOnPauseCheckbox = NSButton(checkboxWithTitle: "Fix automatically when I pause typing", target: nil, action: nil)
     private let pauseDelaySlider = NSSlider()
@@ -2532,6 +2744,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         pickerShortcutField.stringValue = ShortcutParser.display(key: config.pickerKey, modifiers: config.pickerModifiers)
         autoFixShortcutField.stringValue = ShortcutParser.display(key: config.autoFixKey, modifiers: config.autoFixModifiers)
         launchAtLoginCheckbox.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        saveHistoryCheckbox.state = config.saveFixHistory ? .on : .off
         replaceWithoutClipboardCheckbox.state = config.replaceWithoutClipboard ? .on : .off
         fixOnPauseCheckbox.state = config.fixOnPause ? .on : .off
         pauseDelaySlider.doubleValue = config.fixOnPauseWait
@@ -2693,6 +2906,13 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         // MARK: General
 
         let general = NSView()
+        saveHistoryCheckbox.toolTip = "Keeps each fix's text, prompt, and the edits you made before sending in history.jsonl in the config folder, for improving prompts. Nothing leaves this Mac."
+        let historyButtons = NSStackView(views: [
+            NSButton(title: "Show in Finder", target: self, action: #selector(showHistoryPressed)),
+            NSButton(title: "Clear History…", target: self, action: #selector(clearHistoryPressed)),
+        ])
+        historyButtons.orientation = .horizontal
+        historyButtons.spacing = 8
         let generalGrid = formGrid([
             [formLabel("Provider:"), providerPopup],
             [formLabel("API Key:"), apiKeyField],
@@ -2701,9 +2921,13 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             [formLabel("Endpoint:"), endpointField],
             [formLabel("Picker Shortcut:"), pickerShortcutField],
             [NSGridCell.emptyContentView, launchAtLoginCheckbox],
+            [NSGridCell.emptyContentView, saveHistoryCheckbox],
+            [NSGridCell.emptyContentView, historyButtons],
         ])
         generalGrid.cell(for: providerPopup)?.xPlacement = .leading
         generalGrid.cell(for: launchAtLoginCheckbox)?.xPlacement = .leading
+        generalGrid.cell(for: saveHistoryCheckbox)?.xPlacement = .leading
+        generalGrid.cell(for: historyButtons)?.xPlacement = .leading
         general.addSubview(generalGrid)
 
         // MARK: Auto-fix
@@ -3094,6 +3318,31 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         window?.orderOut(nil)
     }
 
+    // The history buttons act on the file right away, not on Save.
+    private var history: FixHistory {
+        FixHistory(configDir: currentConfig.configDir, enabled: currentConfig.saveFixHistory)
+    }
+
+    @objc private func showHistoryPressed() {
+        if FileManager.default.fileExists(atPath: history.url.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([history.url])
+        } else {
+            NSWorkspace.shared.open(currentConfig.configDir)
+        }
+    }
+
+    @objc private func clearHistoryPressed() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Clear fix history?"
+        alert.informativeText = "This deletes every saved fix and follow-up on this Mac. It can't be undone."
+        alert.addButton(withTitle: "Clear History").hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        history.clear()
+        statusLabel.stringValue = "Fix history cleared."
+    }
+
     @objc private func savePressed() {
         do {
             commitDetailFields()
@@ -3148,6 +3397,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
                 fixOnPauseApps: pauseAppDrafts,
                 fixOnPauseWait: (pauseDelaySlider.doubleValue * 10).rounded() / 10,
                 fixOnPauseMinWords: minWordsStepper.integerValue,
+                saveFixHistory: saveHistoryCheckbox.state == .on,
                 prompts: prompts,
                 provider: provider,
                 model: model.isEmpty ? nil : model,
@@ -3658,6 +3908,7 @@ enum CLIInstaller {
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var config: RuntimeConfig!
     private var logger: Logger!
+    private var history: FixHistory!
     private var promptLoader: PromptLoader!
     private var client: OpenAICompatibleClient!
     private var overlay = OverlayPanel()
@@ -3687,6 +3938,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastPauseFinished: Date?
     // The field text a pause fix last left clean, so pausing again without typing doesn't call the model.
     private var lastPauseValue: String?
+    // The field the last fix went into, followed for its history follow-up. At most one at a time.
+    private struct Follow {
+        var followUp: FollowUp
+        let element: AXUIElement
+        let app: NSRunningApplication
+        let ticks: Task<Void, Never>
+        let undoMonitor: Any?
+    }
+    private var follow: Follow?
     // Wait after switching back into an app before checking its field.
     private static let switchBackDelay: TimeInterval = 1
     // Rest after a finished pause fix before the next one.
@@ -3702,6 +3962,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             startupError = error
             config = RuntimeConfig.fallback()
             logger = Logger(enabled: false, configDir: config.configDir)
+            history = FixHistory(configDir: config.configDir, enabled: false)
             promptLoader = PromptLoader(config: config)
             client = OpenAICompatibleClient(config: config)
         }
@@ -3737,6 +3998,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        observeFollow(.quit(at: Date()))
+    }
+
     func trigger(style: StyleConfig, fromMenu: Bool = false) {
         guard !isProcessing else { return }
         isProcessing = true
@@ -3756,6 +4021,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     systemPrompt: systemPrompt,
                     input: session.originalText,
                     session: session,
+                    style: style.id,
                     loadingTitle: session.replacesSelection ? "Fixing selected text…" : "Fixing clipboard text…"
                 )
             } catch {
@@ -3778,7 +4044,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 stylePicker.onPick = { [weak self] style in
                     guard let self else { return }
                     let systemPrompt = self.promptLoader.prompt(for: style)
-                    self.startFix(systemPrompt: systemPrompt, input: session.originalText, session: session)
+                    self.startFix(systemPrompt: systemPrompt, input: session.originalText, session: session, style: style.id)
                 }
                 stylePicker.onCustom = { [weak self] instruction in
                     guard let self else { return }
@@ -4019,6 +4285,61 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // `text`: what the field holds after the fix, when known. Electron apps update their reported text a
+    // beat after a write, so reading it right away could log the fix itself as the first edit.
+    private func startFollowing(fixID: String, element: AXUIElement, app: NSRunningApplication, text: String? = nil) {
+        guard history.enabled else { return }
+        endFollow(fixing: element)
+        let ticks = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                self?.followTick()
+            }
+        }
+        // Only ⌘Z is looked at; every other key is ignored and nothing typed is kept.
+        let undoMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == UInt16(kVK_ANSI_Z), event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command else { return }
+            MainActor.assumeIsolated {
+                self?.followUndo()
+            }
+        }
+        follow = Follow(followUp: FollowUp(fixID: fixID, start: Date(), text: text ?? TextSelectionIO.followedText(of: element)), element: element, app: app, ticks: ticks, undoMonitor: undoMonitor)
+    }
+
+    // A new fix ends the follow before it: as fixed again in the same field, otherwise as left.
+    private func endFollow(fixing element: AXUIElement?) {
+        guard let follow else { return }
+        let fixesSameField = element.map { CFEqual($0, follow.element) } ?? false
+        observeFollow(fixesSameField ? .refixed(at: Date()) : .otherField(at: Date()))
+    }
+
+    private func followTick() {
+        guard let follow else { return }
+        // With nothing focused, the app may still be putting focus back after a switch, so that waits too.
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == follow.app.processIdentifier,
+              let focused = TextSelectionIO.focusedElement(of: follow.app) else {
+            observeFollow(.away(at: Date()))
+            return
+        }
+        observeFollow(CFEqual(focused, follow.element) ? .text(TextSelectionIO.followedText(of: follow.element), at: Date()) : .otherField(at: Date()))
+    }
+
+    private func followUndo() {
+        guard let follow, NSWorkspace.shared.frontmostApplication?.processIdentifier == follow.app.processIdentifier else { return }
+        observeFollow(.undo(at: Date()))
+    }
+
+    private func observeFollow(_ observation: FollowUp.Observation) {
+        guard let end = follow?.followUp.observe(observation), let ended = follow else { return }
+        follow = nil
+        ended.ticks.cancel()
+        if let monitor = ended.undoMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        history.append(ended.followUp.record(end, at: observation.at))
+    }
+
     // Only over a "Fixing…" pill already on screen: an early cancel has no caret position of its own.
     private func showCancelledPill() {
         guard pill.isVisible else { return }
@@ -4050,12 +4371,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pill.show("Fixing…")
         }
         let session = try await TextSelectionIO.captureForAutoFix(wholeFieldOnly: quiet)
+        let prompt = promptLoader.prompt(for: style)
         let started = Date()
-        let fixed = try await client.fix(text: session.originalText, systemPrompt: promptLoader.prompt(for: style))
+        let fixed = try await client.fix(text: session.originalText, systemPrompt: prompt)
         try Task.checkCancellation()
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
         let result = fixed.text.withOuterWhitespace(of: session.originalText)
-        logger.log("autofix complete", ["mode": session.replacesWholeField ? "field" : "selection", "accessibility": session.focusedElement != nil, "app": session.sourceApp?.bundleIdentifier ?? "", "durationMs": Int(Date().timeIntervalSince(started) * 1000), "inputLength": session.originalText.count, "outputLength": result.count, "cost": fixed.cost ?? 0])
-        guard result != session.originalText else { return .unchanged }
+        logger.log("autofix complete", ["mode": session.replacesWholeField ? "field" : "selection", "accessibility": session.focusedElement != nil, "app": session.sourceApp?.bundleIdentifier ?? "", "durationMs": ms, "inputLength": session.originalText.count, "outputLength": result.count, "cost": fixed.cost ?? 0])
+        let field = session.focusedElement ?? session.targetElement
+        // Ended before writing, so the follow-up of the last fix doesn't record this one's text as an edit.
+        endFollow(fixing: field)
+        func record(_ outcome: FixResult, _ method: WriteMethod? = nil) {
+            let fix = FixRecord(path: quiet ? .pause : .shortcut, app: session.sourceApp?.bundleIdentifier, style: style.id, prompt: prompt, provider: config.provider.rawValue, model: config.model, input: session.originalText, output: fixed.text, result: outcome, writeMethod: method, ms: ms)
+            history.append(fix)
+            if let field, let app = session.sourceApp {
+                startFollowing(fixID: fix.id, element: field, app: app, text: outcome == .written && session.replacesWholeField ? result : nil)
+            }
+        }
+        guard result != session.originalText else {
+            record(.unchanged)
+            return .unchanged
+        }
         guard TextSelectionIO.targetUnchanged(session) else {
             // Switched away while a pause fix ran: a direct write still lands in the field it was read from,
             // as long as its text hasn't changed. Pasting can't, since it types into whatever is in front.
@@ -4063,24 +4399,30 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 await TextSelectionIO.replaceDirectly(with: result, in: session)
             }).value {
                 logger.log("autofix write", ["method": "direct", "background": true])
+                record(.written, .direct)
                 return .fixed
             }
+            record(.dropped)
             throw FixitError.targetChanged
         }
+        let method: WriteMethod
         // Unstructured like the paste below: a cancel mid-poll would skip its waits, report the write as
         // failed, and paste a second copy.
         if config.replaceWithoutClipboard || quiet, await Task(operation: { @MainActor in
             await TextSelectionIO.replaceDirectly(with: result, in: session)
         }).value {
             logger.log("autofix write", ["method": "direct"])
+            method = .direct
         } else {
             logger.log("autofix write", ["method": "paste"])
             // Unstructured so a late cancel can't stop it between pasting and restoring the clipboard.
             try await Task { @MainActor in
                 try await TextSelectionIO.replaceSelectedText(with: result, in: session, refocus: false)
             }.value
+            method = .paste
         }
         TextSelectionIO.restoreCaret(in: session, fixedText: result)
+        record(.written, method)
         return .fixed
     }
 
@@ -4125,22 +4467,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func refine(instruction: String, input: String, session: TextTargetSession) {
+    // `fixID`: the fix being refined, which the refined fix's history record links back to.
+    private func refine(instruction: String, input: String, session: TextTargetSession, fixID: String) {
         logger.log("refine start", ["instructionLength": instruction.count])
-        startFix(systemPrompt: PromptLoader.customInstructionPrompt(instruction), input: input, session: session, loadingTitle: "Applying your instruction…")
+        startFix(systemPrompt: PromptLoader.customInstructionPrompt(instruction), input: input, session: session, refines: fixID, loadingTitle: "Applying your instruction…")
     }
 
-    private func startFix(systemPrompt: String, input: String, session: TextTargetSession, loadingTitle: String = "Fixing selected text…") {
+    private func startFix(systemPrompt: String, input: String, session: TextTargetSession, style: String? = nil, refines: String? = nil, loadingTitle: String = "Fixing selected text…") {
         guard !isProcessing else { return }
         isProcessing = true
         Task { @MainActor in
-            await performFix(systemPrompt: systemPrompt, input: input, session: session, loadingTitle: loadingTitle)
+            await performFix(systemPrompt: systemPrompt, input: input, session: session, style: style, refines: refines, loadingTitle: loadingTitle)
             isProcessing = false
         }
     }
 
     // Callers own the isProcessing flag; this wires cancellation, runs the request, and presents the outcome.
-    private func performFix(systemPrompt: String, input: String, session: TextTargetSession, loadingTitle: String = "Fixing selected text…") async {
+    private func performFix(systemPrompt: String, input: String, session: TextTargetSession, style: String? = nil, refines: String? = nil, loadingTitle: String = "Fixing selected text…") async {
         overlay.onCancel = { [weak self] in
             self?.logger.log("fix cancelled")
             self?.currentFixTask?.cancel()
@@ -4148,7 +4491,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         overlay.showLoading(title: loadingTitle, subtitle: "Calling \(config.provider.label)")
         let task = Task { @MainActor in
             do {
-                try await runFix(systemPrompt: systemPrompt, input: input, session: session)
+                try await runFix(systemPrompt: systemPrompt, input: input, session: session, style: style, refines: refines)
             } catch is CancellationError {
                 overlay.hide()
             } catch let error as URLError where error.code == .cancelled {
@@ -4162,17 +4505,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         currentFixTask = nil
     }
 
-    private func runFix(systemPrompt: String, input: String, session: TextTargetSession) async throws {
+    private func runFix(systemPrompt: String, input: String, session: TextTargetSession, style: String?, refines: String?) async throws {
         let started = Date()
         let fixed = try await client.fix(text: input, systemPrompt: systemPrompt) { [weak self] partial in
             self?.overlay.updateStreaming(text: partial)
         }
-        logger.log("fix complete", ["durationMs": Int(Date().timeIntervalSince(started) * 1000), "inputLength": input.count, "outputLength": fixed.text.count, "cost": fixed.cost ?? 0])
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        logger.log("fix complete", ["durationMs": ms, "inputLength": input.count, "outputLength": fixed.text.count, "cost": fixed.cost ?? 0])
+        let fix = FixRecord(path: .review, app: session.sourceApp?.bundleIdentifier, style: style, prompt: systemPrompt, provider: config.provider.rawValue, model: config.model, input: input, output: fixed.text, result: .shown, writeMethod: nil, ms: ms, refines: refines)
+        history.append(fix)
         overlay.onAccept = { [weak self] in
+            self?.recordOutcome(session.replacesSelection ? .accepted : .copied, of: fix.id)
             if session.replacesSelection {
                 Task { @MainActor in
                     do {
                         try await TextSelectionIO.replaceSelectedText(with: fixed.text, in: session)
+                        if let app = session.sourceApp, let element = TextSelectionIO.focusedElement(of: app) {
+                            self?.startFollowing(fixID: fix.id, element: element, app: app)
+                        }
                     } catch {
                         self?.showError(error.localizedDescription)
                     }
@@ -4183,15 +4533,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 pasteboard.setString(fixed.text, forType: .string)
             }
         }
-        overlay.onDismiss = nil
+        overlay.onDismiss = { [weak self] in
+            self?.recordOutcome(.dismissed, of: fix.id)
+        }
         overlay.onRefine = { [weak self] instruction in
-            self?.refine(instruction: instruction, input: fixed.text, session: session)
+            self?.recordOutcome(.refined, of: fix.id, instruction: instruction)
+            self?.refine(instruction: instruction, input: fixed.text, session: session, fixID: fix.id)
         }
         overlay.showResult(
             original: session.originalText,
             fixed: fixed.text,
             acceptTitle: session.replacesSelection ? "Replace" : "Copy to Clipboard"
         )
+    }
+
+    private func recordOutcome(_ outcome: OutcomeRecord.Outcome, of fixID: String, instruction: String? = nil) {
+        // The panel keeps its handlers once closed, and a later error panel's Dismiss isn't this fix's.
+        overlay.onDismiss = nil
+        history.append(OutcomeRecord(id: fixID, outcome: outcome, instruction: instruction))
     }
 
     private func handleTriggerError(_ error: Error) {
@@ -4210,6 +4569,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func reloadRuntime() throws -> [String] {
         config = try RuntimeConfig.load()
         logger = Logger(enabled: config.debugLogging, configDir: config.configDir)
+        history = FixHistory(configDir: config.configDir, enabled: config.saveFixHistory)
         promptLoader = PromptLoader(config: config)
         client = OpenAICompatibleClient(config: config)
         updatePauseMonitor()
