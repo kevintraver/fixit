@@ -367,6 +367,7 @@ enum FixitError: LocalizedError {
     case unreadableSelection
     case secureField
     case targetChanged
+    case refused
     case accessibilityRequired
     case api(String)
 
@@ -381,6 +382,7 @@ enum FixitError: LocalizedError {
         case .unreadableSelection: "This app doesn't let Fixit read the selected text, so auto-fix can't tell if it changes while fixing. Use a style's shortcut to review the fix instead."
         case .secureField: "Fixit won't read password fields."
         case .targetChanged: "Text changed while fixing; nothing was replaced."
+        case .refused: "The model refused instead of fixing the text, so nothing was replaced."
         case .accessibilityRequired: "Accessibility permission required. Open System Settings → Privacy & Security → Accessibility."
         case .api(let message): message
         }
@@ -1262,6 +1264,25 @@ enum AutoFixTarget: Equatable {
         return trimmed.isEmpty || trimmed == placeholder?.trimmingCharacters(in: invisible)
     }
 
+    /// Whether the model answered with a refusal instead of the fixed text, as it can for text that reads like
+    /// an instruction to it. Only short replies count, and only when the input didn't open the same way.
+    static func isRefusal(_ output: String, input: String) -> Bool {
+        // Letters and single spaces only, so a typed "im sorry" opens the same way as "I'm sorry,".
+        func opening(_ text: String) -> String {
+            String(text.lowercased().unicodeScalars.filter { CharacterSet.letters.contains($0) || $0 == " " })
+                .split(separator: " ").joined(separator: " ")
+        }
+        guard output.count < 300 else { return false }
+        let reply = opening(output)
+        guard let start = refusalOpenings.first(where: reply.hasPrefix) else { return false }
+        return !opening(input).hasPrefix(start)
+    }
+
+    private static let refusalOpenings = [
+        "im sorry", "i am sorry", "sorry but", "sorry i cant", "i cant help", "i cannot help",
+        "i cant assist", "i cannot assist", "im unable to", "i am unable to", "i wont be able to",
+    ]
+
     /// Whether the caret sits after the last character, so typing is adding to the end rather than editing
     /// earlier text. Trailing whitespace doesn't count: Electron apps report an invisible final newline.
     static func caretAtEnd(value: String, selection: NSRange) -> Bool {
@@ -1292,7 +1313,7 @@ enum FixPath: String, Encodable {
 
 /// What became of a fix's text. `dropped`: the field changed while the model ran, so nothing was written.
 enum FixResult: String, Encodable {
-    case written, unchanged, dropped, shown
+    case written, unchanged, dropped, shown, refused
 }
 
 enum WriteMethod: String, Encodable {
@@ -1357,6 +1378,8 @@ struct FollowUpRecord: Encodable {
     let versions: [Version]
     let undos: Int
     let final: String?
+    var oldField: String?
+    var newField: String?
 }
 
 /// Follows the field a fix went into, one observation at a time, until one of them ends it.
@@ -1387,6 +1410,12 @@ struct FollowUp {
     private var lastNonEmpty: String?
     private var versions: [FollowUpRecord.Version] = []
     private var undos = 0
+    // Chat apps clear the field when a message is sent, but one empty read can also be a field caught
+    // mid-update (an @mention being inserted), so a send takes two in a row, or one and then leaving.
+    private var emptyRead = false
+
+    /// The field's text as last seen, for recognizing it after an editor swaps in a new element.
+    var lastKnownText: String? { lastText }
 
     /// `text`: the field's text when following starts.
     init(fixID: String, start: Date, text: String?) {
@@ -1400,22 +1429,26 @@ struct FollowUp {
     mutating func observe(_ observation: Observation) -> FollowUpEnd? {
         switch observation {
         case .text(let text, let at):
-            if let text, text != lastText {
-                if Self.isBlank(text) {
-                    // Chat apps clear the field when a message is sent.
-                    if let lastText, !Self.isBlank(lastText) { return .sent }
-                } else {
-                    versions.append(FollowUpRecord.Version(t: (at.timeIntervalSince(start) * 10).rounded() / 10, text: text))
-                    lastNonEmpty = text
+            guard let text else { return idle(at: at) }
+            if Self.isBlank(text) {
+                if let lastText, !Self.isBlank(lastText) {
+                    if emptyRead { return .sent }
+                    emptyRead = true
                 }
+                return idle(at: at)
+            }
+            emptyRead = false
+            if text != lastText {
+                versions.append(FollowUpRecord.Version(t: (at.timeIntervalSince(start) * 10).rounded() / 10, text: text))
+                lastNonEmpty = text
                 lastText = text
                 lastChange = at
             }
             return idle(at: at)
         case .away(let at):
-            return idle(at: at)
+            return emptyRead ? .sent : idle(at: at)
         case .otherField:
-            return .leftField
+            return emptyRead ? .sent : .leftField
         case .undo:
             undos += 1
             return nil
@@ -1426,8 +1459,10 @@ struct FollowUp {
         }
     }
 
-    func record(_ end: FollowUpEnd, at: Date) -> FollowUpRecord {
-        FollowUpRecord(id: fixID, at: at, end: end, seconds: Int(at.timeIntervalSince(start).rounded()), versions: versions, undos: undos, final: lastNonEmpty)
+    // `oldField`, `newField`: for a left-field ending, what became of the followed field and the one now in
+    // focus, so endings an app makes ambiguous (a send that replaces the field) can be told apart later.
+    func record(_ end: FollowUpEnd, at: Date, oldField: String? = nil, newField: String? = nil) -> FollowUpRecord {
+        FollowUpRecord(id: fixID, at: at, end: end, seconds: Int(at.timeIntervalSince(start).rounded()), versions: versions, undos: undos, final: lastNonEmpty, oldField: oldField, newField: newField)
     }
 
     private func idle(at: Date) -> FollowUpEnd? {
@@ -1916,6 +1951,16 @@ enum TextSelectionIO {
         var session = try await captureSelection()
         session.replacesWholeField = true
         return session
+    }
+
+    /// For a history follow-up that ended because focus moved: whether a field still exists, and whether it
+    /// holds text. Never the text itself.
+    @MainActor
+    static func fieldState(of element: AXUIElement) -> String {
+        var value: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .invalidUIElement { return "gone" }
+        guard let text = followedText(of: element) else { return "unreadable" }
+        return text.isEmpty ? "empty" : "has text"
     }
 
     /// A followed field's text for its fix's follow-up: empty when the field reads as blank, which for
@@ -3941,7 +3986,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // The field the last fix went into, followed for its history follow-up. At most one at a time.
     private struct Follow {
         var followUp: FollowUp
-        let element: AXUIElement
+        var element: AXUIElement
         let app: NSRunningApplication
         let ticks: Task<Void, Never>
         let undoMonitor: Any?
@@ -4090,6 +4135,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // An empty field has nothing to fix; a quick note instead of an error panel.
                 logger.log("autofix skipped", ["reason": "no text"])
                 pill.show("Nothing to fix", hideAfter: 1.2)
+            } catch FixitError.refused {
+                logger.log("autofix skipped", ["reason": "refused"])
+                pill.show("Not fixed: the model refused", hideAfter: 2)
             } catch FixitError.targetChanged {
                 // The text changed while the fix ran, usually because typing carried on. Writing would
                 // overwrite it, so drop the fix; pressing the shortcut again fixes the new text.
@@ -4169,7 +4217,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // that comes due while another app is in front does nothing, so leaving needs no cancel; cancelling here
     // would also race the click that brought the app back.
     private func pauseAppActivated(_ app: NSRunningApplication) {
-        guard let bundleID = app.bundleIdentifier, config.fixOnPauseApps.contains(bundleID) else { return }
+        guard config.fixOnPause, let bundleID = app.bundleIdentifier, config.fixOnPauseApps.contains(bundleID) else { return }
         guard editedApps.contains(app.processIdentifier) else {
             logger.log("pausefix skipped", ["app": bundleID, "trigger": "app switch", "reason": "no typing since its last fix or since Fixit started"])
             return
@@ -4274,6 +4322,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 log("skipped", ["reason": "blank"])
             } catch FixitError.notEditable {
                 log("skipped", ["reason": "not a text field"])
+            } catch FixitError.refused {
+                // A finished request: keep the cooldown, so the same text isn't sent again on every pause.
+                lastPauseFinished = Date()
+                log("skipped", ["reason": "refused"])
             } catch {
                 // A pause never interrupts with an error panel; the hotkey reports problems. A failing
                 // provider still gets the cooldown, so it isn't retried on every pause.
@@ -4310,8 +4362,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // A new fix ends the follow before it: as fixed again in the same field, otherwise as left.
     private func endFollow(fixing element: AXUIElement?) {
         guard let follow else { return }
-        let fixesSameField = element.map { CFEqual($0, follow.element) } ?? false
-        observeFollow(fixesSameField ? .refixed(at: Date()) : .otherField(at: Date()))
+        if let element, CFEqual(element, follow.element) {
+            observeFollow(.refixed(at: Date()))
+        } else {
+            observeFollow(.otherField(at: Date()), oldField: TextSelectionIO.fieldState(of: follow.element), newField: element.map(TextSelectionIO.fieldState(of:)))
+        }
     }
 
     private func followTick() {
@@ -4322,7 +4377,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             observeFollow(.away(at: Date()))
             return
         }
-        observeFollow(CFEqual(focused, follow.element) ? .text(TextSelectionIO.followedText(of: follow.element), at: Date()) : .otherField(at: Date()))
+        if CFEqual(focused, follow.element) {
+            observeFollow(.text(TextSelectionIO.followedText(of: follow.element), at: Date()))
+            return
+        }
+        // Some editors (Notion) swap in a new element for a field when text is written to it; the same text
+        // in the newly focused element means it's the same field.
+        let focusedText = TextSelectionIO.followedText(of: focused)
+        if let focusedText, !focusedText.isEmpty, focusedText == follow.followUp.lastKnownText {
+            self.follow?.element = focused
+            observeFollow(.text(focusedText, at: Date()))
+            return
+        }
+        observeFollow(.otherField(at: Date()), oldField: TextSelectionIO.fieldState(of: follow.element), newField: TextSelectionIO.fieldState(of: focused))
     }
 
     private func followUndo() {
@@ -4330,14 +4397,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observeFollow(.undo(at: Date()))
     }
 
-    private func observeFollow(_ observation: FollowUp.Observation) {
+    private func observeFollow(_ observation: FollowUp.Observation, oldField: String? = nil, newField: String? = nil) {
         guard let end = follow?.followUp.observe(observation), let ended = follow else { return }
         follow = nil
         ended.ticks.cancel()
         if let monitor = ended.undoMonitor {
             NSEvent.removeMonitor(monitor)
         }
-        history.append(ended.followUp.record(end, at: observation.at))
+        let leftField = end == .leftField
+        history.append(ended.followUp.record(end, at: observation.at, oldField: leftField ? oldField : nil, newField: leftField ? newField : nil))
     }
 
     // Only over a "Fixing…" pill already on screen: an early cancel has no caret position of its own.
@@ -4387,6 +4455,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let field, let app = session.sourceApp {
                 startFollowing(fixID: fix.id, element: field, app: app, text: outcome == .written && session.replacesWholeField ? result : nil)
             }
+        }
+        // A refusal would replace the user's text with an apology.
+        if AutoFixTarget.isRefusal(fixed.text, input: session.originalText) {
+            record(.refused)
+            throw FixitError.refused
         }
         guard result != session.originalText else {
             record(.unchanged)

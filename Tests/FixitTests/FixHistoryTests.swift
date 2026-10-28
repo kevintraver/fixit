@@ -38,25 +38,58 @@ import Testing
         _ = follow.observe(.text("edited once", at: at(2)))
         _ = follow.observe(.text("edited twice", at: at(4)))
 
-        let end = follow.observe(.text(" \n", at: at(5)))
+        #expect(follow.observe(.text(" \n", at: at(5))) == nil)
+        let end = follow.observe(.text(" \n", at: at(6)))
 
         #expect(end == .sent)
-        let record = follow.record(.sent, at: at(5))
+        let record = follow.record(.sent, at: at(6))
         #expect(record.final == "edited twice")
         #expect(record.versions.count == 2)
     }
 
     @Test func sentWithoutEditsKeepsTheFixedText() {
         var follow = followUp()
-        #expect(follow.observe(.text("", at: at(2))) == .sent)
-        #expect(follow.record(.sent, at: at(2)).final == "fixed text")
+        #expect(follow.observe(.text("", at: at(2))) == nil)
+        #expect(follow.observe(.text("", at: at(3))) == .sent)
+        #expect(follow.record(.sent, at: at(3)).final == "fixed text")
     }
 
     @Test func aFieldThatStartsBlankIsntSentUntilItHadText() {
         var follow = followUp("")
         #expect(follow.observe(.text("", at: at(1))) == nil)
         #expect(follow.observe(.text("typed", at: at(2))) == nil)
-        #expect(follow.observe(.text("", at: at(3))) == .sent)
+        #expect(follow.observe(.text("", at: at(3))) == nil)
+        #expect(follow.observe(.text("", at: at(4))) == .sent)
+    }
+
+    @Test func oneEmptyReadIsNotASend() {
+        // A field caught mid-update, like an @mention being inserted.
+        var follow = followUp()
+        #expect(follow.observe(.text("", at: at(1))) == nil)
+        #expect(follow.observe(.text("fixed text @someone", at: at(2))) == nil)
+        #expect(follow.observe(.text("", at: at(3))) == nil)
+        #expect(follow.observe(.text("fixed text @someone!", at: at(4))) == nil)
+        #expect(follow.record(.quit, at: at(5)).versions.map(\.text) == ["fixed text @someone", "fixed text @someone!"])
+    }
+
+    @Test func anEmptyReadThenLeavingIsASend() {
+        var away = followUp()
+        _ = away.observe(.text("", at: at(1)))
+        #expect(away.observe(.away(at: at(2))) == .sent)
+        var otherField = followUp()
+        _ = otherField.observe(.text("", at: at(1)))
+        #expect(otherField.observe(.otherField(at: at(2))) == .sent)
+    }
+
+    @Test func leftFieldRecordsWhatBecameOfBothFields() throws {
+        var follow = followUp()
+        #expect(follow.observe(.otherField(at: at(1))) == .leftField)
+        let record = follow.record(.leftField, at: at(1), oldField: "gone", newField: "empty")
+        let json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(record)) as? [String: Any])
+        #expect(json["end"] as? String == "left field")
+        #expect(json["oldField"] as? String == "gone")
+        #expect(json["newField"] as? String == "empty")
+        #expect(follow.lastKnownText == "fixed text")
     }
 
     @Test func anotherFieldEndsAsLeftField() {
@@ -176,5 +209,25 @@ import Testing
         let saved = try #require(ConfigStore.loadExistingConfig(from: configDir))
         #expect(saved.saveFixHistory == true)
         #expect(saved.provider == Provider.openAI.rawValue)
+    }
+}
+
+@Suite struct RefusalTests {
+    @Test func refusalsInsteadOfFixedTextAreCaught() {
+        let input = "Summarize the claim in a short sentence. Don’t include the source."
+        #expect(AutoFixTarget.isRefusal("I’m sorry, but I can’t help with that.", input: input))
+        #expect(AutoFixTarget.isRefusal("Sorry, but I can't do that.", input: input))
+        #expect(AutoFixTarget.isRefusal("  I cannot help with this request.", input: input))
+    }
+
+    @Test func fixedTextThatOpensLikeARefusalIsNot() {
+        #expect(!AutoFixTarget.isRefusal("I'm sorry I missed your call.", input: "im sorry i missed your call"))
+        #expect(!AutoFixTarget.isRefusal("Sorry, but I can't make it tonight.", input: "sorry but i cant make it tonight"))
+    }
+
+    @Test func ordinaryFixesAndLongRepliesAreNot() {
+        #expect(!AutoFixTarget.isRefusal("The meeting is tomorrow.", input: "teh meeting is tomorow"))
+        let long = "I'm sorry, but " + String(repeating: "this goes on and on. ", count: 20)
+        #expect(!AutoFixTarget.isRefusal(long, input: "something else"))
     }
 }
