@@ -91,6 +91,18 @@ import Testing
         #expect(!AutoFixTarget.isBlank(value: "Message.", placeholder: nil, classList: []))
     }
 
+    @Test(arguments: [
+        // Discord's message box, as its CSS module names it.
+        (["markup_ku1OHH", "editor_SHcSVi", "slateTextArea_q99V_-"], true),
+        (["SlateEditor"], true),
+        (["ql-editor"], false),
+        (["ProseMirror"], false),
+        ([], false),
+    ])
+    func slateEditorsAreRecognizedByClass(classList: [String], isSlate: Bool) {
+        #expect(AutoFixTarget.usesSlate(classList: classList) == isSlate)
+    }
+
     @Test func unreadableValueIsNotBlank() {
         // The copy fallback decides then.
         #expect(!AutoFixTarget.isBlank(value: nil, placeholder: nil, classList: []))
