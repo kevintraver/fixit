@@ -1250,6 +1250,13 @@ enum AutoFixTarget: Equatable {
         FileManager.default.fileExists(atPath: bundle.appendingPathComponent("Contents/MacOS/XUL").path)
     }
 
+    /// Slate editors, such as Discord's message box, take a written value but leave their own model behind:
+    /// afterwards they ignore every Backspace until the app reloads. Pasting goes through their input
+    /// handling. Slate itself reports nothing to AX, but apps name its classes for it ("slateTextArea_q99V_-").
+    static func usesSlate(classList: [String]) -> Bool {
+        classList.contains { $0.lowercased().hasPrefix("slate") }
+    }
+
     static let terminalBundleIDs: Set<String> = [
         "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty", "com.github.wez.wezterm",
         "net.kovidgoyal.kitty", "org.alacritty", "dev.warp.Warp-Stable", "co.zeit.hyper",
@@ -2019,7 +2026,8 @@ enum TextSelectionIO {
         // A user's own selection has no flash to avoid, so it always pastes. Writing AXSelectedText is
         // unreliable: Firefox deletes the selection without inserting, which passes the value-changed check.
         guard session.replacesWholeField, let element = session.focusedElement,
-              !(session.sourceApp?.bundleURL.map(AutoFixTarget.usesGecko) ?? false) else { return false }
+              !(session.sourceApp?.bundleURL.map(AutoFixTarget.usesGecko) ?? false),
+              !AutoFixTarget.usesSlate(classList: attribute(element, "AXDOMClassList") as? [String] ?? []) else { return false }
         guard AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, text as CFString) == .success else { return false }
         return await valueChanged(element, from: session.fieldSnapshot?.value)
     }
