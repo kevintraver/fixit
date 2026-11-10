@@ -6,65 +6,65 @@ import Testing
 @Suite struct AutoFixTargetTests {
     @Test func passwordFieldIsRefused() {
         let target = AutoFixTarget.decide(
-            role: "AXTextField", subrole: "AXSecureTextField", valueSettable: true, selectedLength: 0, value: "hunter2", selectedText: nil, hasInlineImages: false)
+            role: "AXTextField", subrole: "AXSecureTextField", valueSettable: true, selectedLength: 0, value: "hunter2", selectedText: nil, valueIsPartial: false)
         #expect(target == .secure)
     }
 
     @Test func selectionWinsOverWholeField() {
         let target = AutoFixTarget.decide(
-            role: "AXTextArea", subrole: nil, valueSettable: true, selectedLength: 4, value: "some text here", selectedText: nil, hasInlineImages: false)
+            role: "AXTextArea", subrole: nil, valueSettable: true, selectedLength: 4, value: "some text here", selectedText: nil, valueIsPartial: false)
         #expect(target == .selection)
     }
 
     @Test func noSelectionFixesWholeField() {
         let target = AutoFixTarget.decide(
-            role: "AXTextField", subrole: nil, valueSettable: true, selectedLength: 0, value: "lets go", selectedText: nil, hasInlineImages: false)
+            role: "AXTextField", subrole: nil, valueSettable: true, selectedLength: 0, value: "lets go", selectedText: nil, valueIsPartial: false)
         #expect(target == .field("lets go"))
     }
 
     @Test func settableValueCountsAsEditable() {
         let target = AutoFixTarget.decide(
-            role: "AXGroup", subrole: nil, valueSettable: true, selectedLength: nil, value: "rich editor text", selectedText: nil, hasInlineImages: false)
+            role: "AXGroup", subrole: nil, valueSettable: true, selectedLength: nil, value: "rich editor text", selectedText: nil, valueIsPartial: false)
         #expect(target == .field("rich editor text"))
     }
 
     @Test func nonEditableElementIsRejected() {
         let target = AutoFixTarget.decide(
-            role: "AXWebArea", subrole: nil, valueSettable: false, selectedLength: 10, value: nil, selectedText: nil, hasInlineImages: false)
+            role: "AXWebArea", subrole: nil, valueSettable: false, selectedLength: 10, value: nil, selectedText: nil, valueIsPartial: false)
         #expect(target == .notEditable)
-        #expect(AutoFixTarget.decide(role: nil, subrole: nil, valueSettable: false, selectedLength: nil, value: nil, selectedText: nil, hasInlineImages: false) == .notEditable)
+        #expect(AutoFixTarget.decide(role: nil, subrole: nil, valueSettable: false, selectedLength: nil, value: nil, selectedText: nil, valueIsPartial: false) == .notEditable)
     }
 
     @Test func editableWithoutReadableValueIsRefused() {
         // Nothing to compare before replacing the whole field, so typing during the request would be lost.
         let target = AutoFixTarget.decide(
-            role: "AXTextArea", subrole: nil, valueSettable: false, selectedLength: nil, value: nil, selectedText: nil, hasInlineImages: true)
+            role: "AXTextArea", subrole: nil, valueSettable: false, selectedLength: nil, value: nil, selectedText: nil, valueIsPartial: true)
         #expect(target == .unreadable)
     }
 
     @Test func selectionInUnreadableFieldIsCheckedByItsSelectedText() {
         // With no readable value, the selected text is all that can show an edit made while fixing.
         let target = AutoFixTarget.decide(
-            role: "AXTextArea", subrole: nil, valueSettable: true, selectedLength: 4, value: nil, selectedText: "some", hasInlineImages: false)
+            role: "AXTextArea", subrole: nil, valueSettable: true, selectedLength: 4, value: nil, selectedText: "some", valueIsPartial: false)
         #expect(target == .selection)
     }
 
     @Test func selectionWithNothingReadableIsRefused() {
         let target = AutoFixTarget.decide(
-            role: "AXTextArea", subrole: nil, valueSettable: true, selectedLength: 4, value: nil, selectedText: nil, hasInlineImages: false)
+            role: "AXTextArea", subrole: nil, valueSettable: true, selectedLength: 4, value: nil, selectedText: nil, valueIsPartial: false)
         #expect(target == .unreadableSelection)
     }
 
     @Test func inlineImagesFallBackToCopy() {
         // Slack draws emoji as images that its value leaves out; fixing that value would delete them.
         let target = AutoFixTarget.decide(
-            role: "AXTextArea", subrole: nil, valueSettable: true, selectedLength: 0, value: "they are going \n", selectedText: nil, hasInlineImages: true)
+            role: "AXTextArea", subrole: nil, valueSettable: true, selectedLength: 0, value: "they are going \n", selectedText: nil, valueIsPartial: true)
         #expect(target == .unknown)
     }
 
     @Test func emptyFieldIsPassedThrough() {
         let target = AutoFixTarget.decide(
-            role: "AXTextField", subrole: nil, valueSettable: true, selectedLength: 0, value: "", selectedText: nil, hasInlineImages: false)
+            role: "AXTextField", subrole: nil, valueSettable: true, selectedLength: 0, value: "", selectedText: nil, valueIsPartial: false)
         #expect(target == .field(""))
     }
 }
@@ -89,6 +89,23 @@ import Testing
     @Test func realTextIsNotBlank() {
         #expect(!AutoFixTarget.isBlank(value: "teh meeting", placeholder: "Message.", classList: ["ql-editor"]))
         #expect(!AutoFixTarget.isBlank(value: "Message.", placeholder: nil, classList: []))
+    }
+
+    @Test(arguments: [
+        // Slack's chip for a pasted https://x.com/AstrablueAI/status/2119098694406635840.
+        ("x.com/AstrablueAI/status/2119098694406635840", true),
+        ("example.com", true),
+        ("docs.example.co.uk/a?b=c#d", true),
+        ("localhost.dev:3000/path", true),
+        // A typed link keeps its scheme, so the value already has all of it.
+        ("https://x.com/AstrablueAI", false),
+        ("this is a test ", false),
+        ("see x.com/AstrablueAI for more", false),
+        ("e.g.", false),
+        ("", false),
+    ])
+    func shortenedLinksAreRecognized(run: String, isLink: Bool) {
+        #expect(AutoFixTarget.looksLikeShortenedLink(run) == isLink)
     }
 
     @Test(arguments: [

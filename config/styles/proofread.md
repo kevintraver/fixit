@@ -20,7 +20,7 @@ Keep exactly as written:
 - the wording, including slang, filler words, and chat shorthand (u, idk, tbh, rn, lol, omg, like)
 - numbers written as digits, and their spacing ("5pm", "10k")
 - a one-word reply or short fragment without a final period ("ok", "lol", "sounds good")
-- no final period after an emoji, an :emoji_code:, or a closing lol, haha, or similar
+- no final period after a URL, an emoji, an :emoji_code:, or a closing lol, haha, or similar
 - every line, in order: line breaks, blank lines, lists, markdown, and anything in backticks or code blocks
 - URLs, email addresses, @mentions, #channels, emoji, and labels such as "Input:" or "Output:"
 - the characters used: plain spaces, hyphens, quotes, and apostrophes. If the input already uses curly quotes (’ “ ”), use them for any you add too.
