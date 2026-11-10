@@ -1201,6 +1201,13 @@ enum AutoFixTarget: Equatable {
         classList.contains { $0.lowercased().hasPrefix("slate") }
     }
 
+    /// Slack shows a pasted link as a chip that reads "x.com/page": no scheme, and no link or URL in AX, only a
+    /// text run of its own. Writing that text back leaves plain text. A copy has the full URL, and pasting it
+    /// makes the chip again. Other text in a run of its own (bold "notes.txt") only costs a copy and a paste.
+    static func looksLikeShortenedLink(_ run: String) -> Bool {
+        run.range(of: #"^([a-z0-9-]+\.)+[a-z]{2,}(:\d+)?([/?#]\S*)?$"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
     static let terminalBundleIDs: Set<String> = [
         "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty", "com.github.wez.wezterm",
         "net.kovidgoyal.kitty", "org.alacritty", "dev.warp.Warp-Stable", "co.zeit.hyper",
@@ -1216,16 +1223,16 @@ enum AutoFixTarget: Equatable {
         return trimmed.isEmpty || trimmed == placeholder?.trimmingCharacters(in: invisible)
     }
 
-    // `hasInlineImages`: rich editors like Slack's draw emoji as images and leave them out of the value,
-    // so fixing that value would delete them.
-    static func decide(role: String?, subrole: String?, valueSettable: Bool, selectedLength: Int?, value: String?, selectedText: String?, hasInlineImages: Bool) -> AutoFixTarget {
+    // `valueIsPartial`: rich editors like Slack's draw emoji as images and leave them out of the value,
+    // and show a link by a shortened name, so fixing that value would delete the emoji and unlink the links.
+    static func decide(role: String?, subrole: String?, valueSettable: Bool, selectedLength: Int?, value: String?, selectedText: String?, valueIsPartial: Bool) -> AutoFixTarget {
         if subrole == kAXSecureTextFieldSubrole { return .secure }
         guard let role, textRoles.contains(role) || valueSettable else { return .notEditable }
         if let selectedLength, selectedLength > 0 {
             return value != nil || selectedText != nil ? .selection : .unreadableSelection
         }
         guard let value else { return .unreadable }
-        return hasInlineImages ? .unknown : .field(value)
+        return valueIsPartial ? .unknown : .field(value)
     }
 }
 
@@ -1345,7 +1352,7 @@ enum TextSelectionIO {
             value: snapshot.value,
             selectedText: snapshot.selectedText,
             // A selection is fixed as copied, so the walk only matters without one.
-            hasInlineImages: !hasSelection && containsImage(element)
+            valueIsPartial: !hasSelection && valueIsPartial(element)
         )
         var session: TextTargetSession
         switch target {
@@ -1490,7 +1497,7 @@ enum TextSelectionIO {
         parameterizedAttribute(field, "AXLengthForTextMarkerRange", AXTextMarkerRangeCreate(kCFAllocatorDefault, start, end)) as? Int
     }
 
-    // Budgeted like containsImage; order doesn't matter, the caller matches spans by offset.
+    // Budgeted like valueIsPartial; order doesn't matter, the caller matches spans by offset.
     private static func staticTexts(in element: AXUIElement) -> [AXUIElement] {
         var found: [AXUIElement] = []
         var pending = [element]
@@ -1605,12 +1612,15 @@ enum TextSelectionIO {
     }
 
     // Budgeted so a long document can't stall the hotkey.
-    private static func containsImage(_ element: AXUIElement) -> Bool {
+    private static func valueIsPartial(_ element: AXUIElement) -> Bool {
         var pending = [element]
         var visited = 0
         while let node = pending.popLast(), visited < 500 {
             visited += 1
-            if attribute(node, kAXRoleAttribute) as? String == kAXImageRole { return true }
+            let role = attribute(node, kAXRoleAttribute) as? String
+            if role == kAXImageRole { return true }
+            if role == kAXStaticTextRole, let run = attribute(node, kAXValueAttribute) as? String,
+               AutoFixTarget.looksLikeShortenedLink(run) { return true }
             pending += attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? []
         }
         return false
